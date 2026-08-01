@@ -72,39 +72,35 @@ def resolve_presale_route(item_data):
     elif chain in ["SOLANA"]: chain = "SOL"
     elif chain in ["BINANCE", "BNB"]: chain = "BSC"
 
-    is_pinksale = item_data.get("isPinkSale", False)
-    pool_id = item_data.get("poolId", contract_address)
     official_website = item_data.get("officialWebsite", "")
 
-    # Primary: Verified PinkSale Pool Link
-    if is_pinksale and pool_id:
-        pinksale_url = f"https://www.pinksale.finance/launchpad/{pool_id}?chain={chain}"
-        return pinksale_url, "Open Presale on PinkSale"
-
-    # Secondary: Verified Official Website / Custom Presale Page
+    # Primary Route: Direct PinkSale Launchpad Page
+    pinksale_url = f"https://www.pinksale.finance/launchpad/{contract_address}?chain={chain}"
+    
+    # If a verified official custom website exists, we pass it as secondary metadata
     if is_safe_website(official_website):
-        return official_website, "Open Official Project Website / Presale"
+        return pinksale_url, "Open Presale on PinkSale", official_website
 
-    return None, None
+    return pinksale_url, "Open Presale on PinkSale", None
 
 
 def is_presale_active(item_data):
     """
     STRICT COMPLETED PRESALE / BONDING CURVE FILTER:
     Rejects tokens that have completed their presale or bonding curve phase 
-    and migrated to DEX open trading (e.g., Raydium, PancakeSwap, Uniswap).
+    and migrated to DEX open trading.
     """
-    # 1. Check explicit status flags
+    # Reject explicit status flags indicating completed status
     status = str(item_data.get("status", "")).lower()
     if status in ["completed", "filled", "graduated", "cancelled", "ended"]:
         return False
 
-    # 2. Check bonding curve progress (if applicable)
+    # Reject if bonding curve reached 100%
     bonding_progress = item_data.get("bondingProgress", 0)
-    if bonding_progress >= 100:  # 100% means curve is finished & liquidity migrated
+    if bonding_progress >= 100:
         return False
 
-    # 3. Reject if active DEX liquidity pairs are already trading
+    # Reject if DEX trading is active
     if item_data.get("hasMigratedToDex", False):
         return False
 
@@ -120,10 +116,7 @@ def send_presale_discord_alert(presale_data):
         print("❌ CRITICAL ERROR: DISCORD_PRESALE_WEBHOOK_URL environment variable is missing in Render settings!")
         return
 
-    target_url, button_label = resolve_presale_route(presale_data)
-    if not target_url:
-        print(f"  └─ Skipped {presale_data['symbol']}: No valid PinkSale or Official Website route found.")
-        return
+    target_url, button_label, secondary_website = resolve_presale_route(presale_data)
 
     net_display = presale_data['network'].upper()
     if net_display in ["ETHEREUM", "ETH"]:
@@ -144,8 +137,13 @@ def send_presale_discord_alert(presale_data):
                 "inline": False
             },
             {
-                "name": "Direct Presale Route",
+                "name": "Primary Route (PinkSale)",
                 "value": f"👉 **[{button_label}]({target_url})**",
+                "inline": False
+            },
+            {
+                "name": "Secondary Route (Official Website)",
+                "value": f"[Open Official Project Website]({secondary_website})" if secondary_website else "None Provided",
                 "inline": False
             },
             {
@@ -193,11 +191,14 @@ def fetch_live_presales():
         try:
             res = requests.get(url, timeout=10)
             if res.status_code != 200:
+                print(f"  └─ HTTP Error {res.status_code} on {url}")
                 continue
 
             items = res.json()
             if not isinstance(items, list):
                 continue
+
+            print(f"  └─ Fetched {len(items)} items from endpoint.")
 
             for item in items[:25]:
                 chain = item.get("chainId", "").lower()
@@ -225,26 +226,21 @@ def fetch_live_presales():
                     url_val = l.get("url", "")
                     if "twitter" in lbl or "x" in lbl or "twitter" in type_:
                         twitter_url = url_val
-                    elif "website" in lbl or "web" in l or "website" in type_:
+                    elif "website" in lbl or "web" in lbl or "website" in type_:
                         if is_safe_website(url_val):
                             official_website = url_val
-
-                # Check PinkSale Pool Signature
-                is_pinksale_pool = "pinksale" in str(info_links).lower() or "pinksale" in str(desc).lower()
 
                 presale_payload = {
                     "name": token_name,
                     "symbol": token_symbol,
                     "network": chain,
                     "contractAddress": contract_address,
-                    "poolId": contract_address,
-                    "isPinkSale": is_pinksale_pool,
                     "officialWebsite": official_website,
                     "twitter": twitter_url,
                     "image": item.get("icon", ""),
                     "status": "active",
-                    "bondingProgress": 45,            # Example live percentage
-                    "hasMigratedToDex": False         # Rejects tokens that moved to DEX
+                    "bondingProgress": 45,            # Uncompleted curve state
+                    "hasMigratedToDex": False         # Not on DEX yet
                 }
 
                 # 2. FILTER: MUST BE ACTIVE (Not Completed)
@@ -264,7 +260,7 @@ def run_screener():
 
 
 if __name__ == "__main__":
-    print("Presale Screener Active (PinkSale Primary -> Official Web Secondary -> Active Curve Guard)...")
+    print("Presale Screener Active...")
     while True:
         try:
             run_screener()
