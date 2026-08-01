@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: gmgn-breakout-tracker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python breakout_tracker.py
+    envVars:
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
