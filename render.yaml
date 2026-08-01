@@ -1,9 +1,20 @@
 services:
+  # Service 1: Memecoin Breakout Tracker
   - type: worker
-    name: gmgn-breakout-tracker
+    name: breakout-tracker
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python breakout_tracker.py
     envVars:
       - key: DISCORD_WEBHOOK_URL
+        sync: false
+
+  # Service 2: Reputable Presale Screener
+  - type: worker
+    name: presale-tracker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python presale_tracker.py
+    envVars:
+      - key: DISCORD_PRESALE_WEBHOOK_URL
         sync: false
