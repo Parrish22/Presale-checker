@@ -11,6 +11,14 @@ ALERTED_PRESALES_CACHE = {}    # { pool_address: timestamp }
 ALERTED_SYMBOLS_CACHE = {}     # { symbol: timestamp }
 PRESALE_COOLDOWN_SECONDS = 24 * 3600  # 24-hour cooldown per presale pool
 
+# Browser User-Agent headers to bypass API scraping blocks
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.pinksale.finance/",
+    "Origin": "https://www.pinksale.finance"
+}
+
 
 def clean_caches():
     """Purges expired items from memory."""
@@ -53,10 +61,9 @@ def build_pinksale_launchpad_url(pool_id, chain):
 def send_pinksale_discord_alert(presale_data):
     """Dispatches callout pointing STRICTLY to PinkSale.com."""
     if not DISCORD_PRESALE_WEBHOOK_URL:
-        print("❌ ERROR: DISCORD_PRESALE_WEBHOOK_URL environment variable is missing!")
+        print("❌ CRITICAL ERROR: DISCORD_PRESALE_WEBHOOK_URL environment variable is missing in Render settings!")
         return
 
-    # Direct PinkSale launchpad URL
     pinksale_url = presale_data["pinksaleUrl"]
     
     net_display = presale_data['network'].upper()
@@ -65,8 +72,8 @@ def send_pinksale_discord_alert(presale_data):
 
     embed = {
         "title": f"🔥 [{net_display}] LIVE PINKSALE PRESALE: ${presale_data['symbol']}",
-        "url": pinksale_url,  # Makes the entire title clickable directly to PinkSale.com
-        "color": 16738816,    # Gold / Flame Orange
+        "url": pinksale_url,  # Makes main title click directly to PinkSale.com
+        "color": 16738816,    # Flame Orange
         "thumbnail": {"url": presale_data.get("image") or "https://www.pinksale.finance/static/media/logo.f081edeb.png"},
         "fields": [
             {"name": "Token Name", "value": presale_data["name"], "inline": True},
@@ -84,7 +91,7 @@ def send_pinksale_discord_alert(presale_data):
             },
             {
                 "name": "Project Social (X / Twitter)",
-                "value": f"[View Project Twitter/X Profile]({presale_data.get('twitter', '#')})" if presale_data.get('twitter') and presale_data.get('twitter') != '#' else "None Provided",
+                "value": f"[View Project Twitter/X Profile]({presale_data.get('twitter')})" if presale_data.get('twitter') and presale_data.get('twitter') != '#' else "None Provided",
                 "inline": False
             },
             {
@@ -99,76 +106,86 @@ def send_pinksale_discord_alert(presale_data):
 
     payload = {"embeds": [embed]}
     try:
-        res = requests.post(DISCORD_PRESALE_WEBHOOK_URL, json=payload, timeout=5)
+        res = requests.post(DISCORD_PRESALE_WEBHOOK_URL, json=payload, timeout=8)
         if res.status_code in [200, 204]:
-            print(f"✅ PINKSALE ALERT DISPATCHED: ${presale_data['symbol']} -> {pinksale_url}")
+            print(f"✅ PINKSALE DISCORD ALERT DISPATCHED: ${presale_data['symbol']} -> {pinksale_url}")
             record_alerted_presale(presale_data["poolAddress"], presale_data["symbol"])
         else:
-            print(f"❌ Discord Post Error ({res.status_code}): {res.text}")
+            print(f"❌ Discord Post Failed HTTP Status: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"❌ Discord Post Exception: {e}")
 
 
 def fetch_live_pinksale_presales():
-    """Queries PinkSale API exclusively for active pools on SOL, ETH, and BSC."""
+    """Queries PinkSale API feeds with browser headers."""
     print("🔍 Querying PinkSale Directory for Live Presales...")
     
-    target_chains = ["bsc", "ethereum", "solana", "sol", "eth"]
+    target_chains = ["bsc", "ethereum", "solana", "sol", "eth", "bnb"]
 
-    url = "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=30&status=active"
+    endpoints = [
+        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=30&status=active",
+        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=30&status=trending"
+    ]
 
-    try:
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
-            print(f"⚠️ PinkSale API returned status code {res.status_code}")
-            return
+    total_found = 0
 
-        data = res.json()
-        pools = data.get("docs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    for url in endpoints:
+        try:
+            res = requests.get(url, headers=HTTP_HEADERS, timeout=12)
+            print(f"  └─ Requesting PinkSale Endpoint ({url}) - Response Code: {res.status_code}")
 
-        for pool in pools:
-            pool_id = pool.get("id") or pool.get("poolAddress")
-            token_obj = pool.get("token", {}) or {}
-            contract_address = token_obj.get("address") or pool_id
-            chain = pool.get("chain", "").lower()
-
-            if not pool_id or chain not in target_chains:
+            if res.status_code != 200:
                 continue
 
-            token_symbol = token_obj.get("symbol") or pool.get("symbol") or "PRESALE"
-            token_name = token_obj.get("name") or pool.get("name") or "PinkSale Presale"
+            data = res.json()
+            pools = data.get("docs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            total_found += len(pools)
 
-            # Skip if already alerted
-            if is_already_alerted(pool_id, token_symbol):
-                continue
+            for pool in pools:
+                pool_id = pool.get("id") or pool.get("poolAddress")
+                token_obj = pool.get("token", {}) or {}
+                contract_address = token_obj.get("address") or pool_id
+                chain = pool.get("chain", "").lower()
 
-            # Explicit PinkSale URL format
-            pinksale_url = build_pinksale_launchpad_url(pool_id, chain)
+                if not pool_id or chain not in target_chains:
+                    continue
 
-            presale_payload = {
-                "name": token_name[:28],
-                "symbol": token_symbol[:10],
-                "network": chain,
-                "poolAddress": pool_id,
-                "contractAddress": contract_address,
-                "pinksaleUrl": pinksale_url,
-                "twitter": pool.get("twitter", "#"),
-                "image": pool.get("logo", "")
-            }
+                token_symbol = token_obj.get("symbol") or pool.get("symbol") or "PRESALE"
+                token_name = token_obj.get("name") or pool.get("name") or "PinkSale Presale"
 
-            send_pinksale_discord_alert(presale_payload)
+                # Deduplication Check
+                if is_already_alerted(pool_id, token_symbol):
+                    print(f"     └─ Skipped Pool {pool_id} (${token_symbol}): Already alerted recently.")
+                    continue
 
-    except Exception as e:
-        print(f"❌ PinkSale Fetch Exception: {e}")
+                pinksale_url = build_pinksale_launchpad_url(pool_id, chain)
+
+                presale_payload = {
+                    "name": str(token_name)[:28],
+                    "symbol": str(token_symbol)[:10],
+                    "network": chain,
+                    "poolAddress": str(pool_id),
+                    "contractAddress": str(contract_address),
+                    "pinksaleUrl": pinksale_url,
+                    "twitter": pool.get("twitter", "#"),
+                    "image": pool.get("logo", "")
+                }
+
+                send_pinksale_discord_alert(presale_payload)
+
+        except Exception as e:
+            print(f"❌ Exception fetching from {url}: {e}")
+
+    print(f"--- Completed Scan. Evaluated {total_found} total pools from PinkSale. ---")
 
 
 def run_screener():
-    print("\n--- Scanning Live PinkSale Presales (SOL, Robinhood ETH, BSC) ---")
+    print(f"\n--- Starting PinkSale Scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} ---")
     fetch_live_pinksale_presales()
 
 
 if __name__ == "__main__":
-    print("PinkSale Screener Active (Direct PinkSale.com Route)...")
+    print("PinkSale Screener Active (Direct Route & Anti-Block Headers Enforced)...")
     while True:
         try:
             run_screener()
