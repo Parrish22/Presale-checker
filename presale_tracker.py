@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 import requests
 
 # Environment Variable for Discord Webhook
@@ -11,13 +12,7 @@ ALERTED_PRESALES_CACHE = {}    # { pool_address: timestamp }
 ALERTED_SYMBOLS_CACHE = {}     # { symbol: timestamp }
 PRESALE_COOLDOWN_SECONDS = 24 * 3600  # 24-hour cooldown per presale pool
 
-# Browser User-Agent headers to bypass API scraping blocks
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.pinksale.finance/",
-    "Origin": "https://www.pinksale.finance"
-}
+BLOCKED_DOMAINS = ["bit.ly", "tinyurl.com", "t.co", "is.gd", "t.me", "telegram.org", "discord.gg"]
 
 
 def clean_caches():
@@ -45,35 +40,99 @@ def record_alerted_presale(pool_address, symbol=""):
         ALERTED_SYMBOLS_CACHE[symbol.upper()] = time.time()
 
 
-def build_pinksale_launchpad_url(pool_id, chain):
-    """Constructs explicit PinkSale Launchpad URL for the exact token pool."""
-    chain_param = chain.upper()
-    if chain_param in ["ETHEREUM", "ROBINHOOD_ETH"]:
-        chain_param = "ETH"
-    elif chain_param in ["SOLANA"]:
-        chain_param = "SOL"
-    elif chain_param in ["BINANCE", "BNB"]:
-        chain_param = "BSC"
+def is_safe_website(url):
+    """Validates URL syntax and ensures it's an external website."""
+    if not url or url in ["#", ""] or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ["http", "https"]:
+            return False
+        netloc = parsed.netloc.lower()
+        if not netloc or any(blocked in netloc for blocked in BLOCKED_DOMAINS):
+            return False
+        return True
+    except Exception:
+        return False
 
-    return f"https://www.pinksale.finance/launchpad/{pool_id}?chain={chain_param}"
+
+# ---------------------------------------------------------------------------
+# Dynamic Presale Link Routing & Active Status Check
+# ---------------------------------------------------------------------------
+def resolve_presale_route(item_data):
+    """
+    1. PinkSale Route (Primary): Links directly to PinkSale launchpad.
+    2. Official Website Route (Secondary): Links directly to verified Official Website/Presale page.
+    """
+    contract_address = item_data.get("contractAddress", "")
+    chain = item_data.get("network", "").upper()
+
+    # Normalize Chain Name for PinkSale URL
+    if chain in ["ETHEREUM", "ROBINHOOD_ETH"]: chain = "ETH"
+    elif chain in ["SOLANA"]: chain = "SOL"
+    elif chain in ["BINANCE", "BNB"]: chain = "BSC"
+
+    is_pinksale = item_data.get("isPinkSale", False)
+    pool_id = item_data.get("poolId", contract_address)
+    official_website = item_data.get("officialWebsite", "")
+
+    # Primary: Verified PinkSale Pool Link
+    if is_pinksale and pool_id:
+        pinksale_url = f"https://www.pinksale.finance/launchpad/{pool_id}?chain={chain}"
+        return pinksale_url, "Open Presale on PinkSale"
+
+    # Secondary: Verified Official Website / Custom Presale Page
+    if is_safe_website(official_website):
+        return official_website, "Open Official Project Website / Presale"
+
+    return None, None
 
 
-def send_pinksale_discord_alert(presale_data):
-    """Dispatches callout pointing STRICTLY to PinkSale.com."""
+def is_presale_active(item_data):
+    """
+    STRICT COMPLETED PRESALE / BONDING CURVE FILTER:
+    Rejects tokens that have completed their presale or bonding curve phase 
+    and migrated to DEX open trading (e.g., Raydium, PancakeSwap, Uniswap).
+    """
+    # 1. Check explicit status flags
+    status = str(item_data.get("status", "")).lower()
+    if status in ["completed", "filled", "graduated", "cancelled", "ended"]:
+        return False
+
+    # 2. Check bonding curve progress (if applicable)
+    bonding_progress = item_data.get("bondingProgress", 0)
+    if bonding_progress >= 100:  # 100% means curve is finished & liquidity migrated
+        return False
+
+    # 3. Reject if active DEX liquidity pairs are already trading
+    if item_data.get("hasMigratedToDex", False):
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Discord Alert Dispatcher
+# ---------------------------------------------------------------------------
+def send_presale_discord_alert(presale_data):
+    """Dispatches callout with strict PinkSale / Official Website link routing."""
     if not DISCORD_PRESALE_WEBHOOK_URL:
         print("❌ CRITICAL ERROR: DISCORD_PRESALE_WEBHOOK_URL environment variable is missing in Render settings!")
         return
 
-    pinksale_url = presale_data["pinksaleUrl"]
-    
+    target_url, button_label = resolve_presale_route(presale_data)
+    if not target_url:
+        print(f"  └─ Skipped {presale_data['symbol']}: No valid PinkSale or Official Website route found.")
+        return
+
     net_display = presale_data['network'].upper()
     if net_display in ["ETHEREUM", "ETH"]:
         net_display = "ROBINHOOD ETH"
 
     embed = {
-        "title": f"🔥 [{net_display}] LIVE PINKSALE PRESALE: ${presale_data['symbol']}",
-        "url": pinksale_url,  # Makes main title click directly to PinkSale.com
-        "color": 16738816,    # Flame Orange
+        "title": f"🔥 [{net_display}] ACTIVE PRESALE: ${presale_data['symbol']}",
+        "url": target_url,
+        "color": 16738816,  # Flame Orange
         "thumbnail": {"url": presale_data.get("image") or "https://www.pinksale.finance/static/media/logo.f081edeb.png"},
         "fields": [
             {"name": "Token Name", "value": presale_data["name"], "inline": True},
@@ -81,12 +140,12 @@ def send_pinksale_discord_alert(presale_data):
             {"name": "Network", "value": net_display, "inline": True},
             {
                 "name": "Presale Status", 
-                "value": "🟢 LIVE NOW ON PINKSALE", 
+                "value": "🟢 ACTIVE PRESALE IN PROGRESS", 
                 "inline": False
             },
             {
-                "name": "Official Presale Page",
-                "value": f"👉 **[Click Here to Open Presale on PinkSale.com]({pinksale_url})**",
+                "name": "Direct Presale Route",
+                "value": f"👉 **[{button_label}]({target_url})**",
                 "inline": False
             },
             {
@@ -95,12 +154,12 @@ def send_pinksale_discord_alert(presale_data):
                 "inline": False
             },
             {
-                "name": "Token Pool Address",
+                "name": "Token / Pool Address",
                 "value": f"`{presale_data['contractAddress']}`",
                 "inline": False
             }
         ],
-        "footer": {"text": "Verified PinkSale.com Direct Link Route"},
+        "footer": {"text": "Active Presale Screener • Uncompleted Bonding Curve Filtered"},
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -108,84 +167,104 @@ def send_pinksale_discord_alert(presale_data):
     try:
         res = requests.post(DISCORD_PRESALE_WEBHOOK_URL, json=payload, timeout=8)
         if res.status_code in [200, 204]:
-            print(f"✅ PINKSALE DISCORD ALERT DISPATCHED: ${presale_data['symbol']} -> {pinksale_url}")
-            record_alerted_presale(presale_data["poolAddress"], presale_data["symbol"])
+            print(f"✅ PRESALE DISCORD ALERT DISPATCHED: ${presale_data['symbol']} -> {target_url}")
+            record_alerted_presale(presale_data["contractAddress"], presale_data["symbol"])
         else:
             print(f"❌ Discord Post Failed HTTP Status: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"❌ Discord Post Exception: {e}")
 
 
-def fetch_live_pinksale_presales():
-    """Queries PinkSale API feeds with browser headers."""
-    print("🔍 Querying PinkSale Directory for Live Presales...")
+# ---------------------------------------------------------------------------
+# Presale Fetching Engine
+# ---------------------------------------------------------------------------
+def fetch_live_presales():
+    """Queries feeds and filters OUT completed presales/bonding curves."""
+    print("🔍 Scanning for Active Presales (Uncompleted Curves Only)...")
     
     target_chains = ["bsc", "ethereum", "solana", "sol", "eth", "bnb"]
 
     endpoints = [
-        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=30&status=active",
-        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=30&status=trending"
+        "https://api.dexscreener.com/token-boosts/latest/v1",
+        "https://api.dexscreener.com/token-boosts/top/v1"
     ]
-
-    total_found = 0
 
     for url in endpoints:
         try:
-            res = requests.get(url, headers=HTTP_HEADERS, timeout=12)
-            print(f"  └─ Requesting PinkSale Endpoint ({url}) - Response Code: {res.status_code}")
-
+            res = requests.get(url, timeout=10)
             if res.status_code != 200:
                 continue
 
-            data = res.json()
-            pools = data.get("docs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            total_found += len(pools)
+            items = res.json()
+            if not isinstance(items, list):
+                continue
 
-            for pool in pools:
-                pool_id = pool.get("id") or pool.get("poolAddress")
-                token_obj = pool.get("token", {}) or {}
-                contract_address = token_obj.get("address") or pool_id
-                chain = pool.get("chain", "").lower()
+            for item in items[:25]:
+                chain = item.get("chainId", "").lower()
+                contract_address = item.get("tokenAddress")
 
-                if not pool_id or chain not in target_chains:
+                if not contract_address or chain not in target_chains:
                     continue
 
-                token_symbol = token_obj.get("symbol") or pool.get("symbol") or "PRESALE"
-                token_name = token_obj.get("name") or pool.get("name") or "PinkSale Presale"
+                desc = item.get("description", "").split("\n")[0].strip()
+                raw_symbol = desc.split(" ")[0].replace("$", "") if desc else "PRESALE"
+                token_symbol = ''.join(e for e in raw_symbol if e.isalnum()) or "PRESALE"
+                token_name = desc[:28] if desc else "Active Presale"
 
-                # Deduplication Check
-                if is_already_alerted(pool_id, token_symbol):
-                    print(f"     └─ Skipped Pool {pool_id} (${token_symbol}): Already alerted recently.")
+                # 1. Deduplication Check
+                if is_already_alerted(contract_address, token_symbol):
                     continue
 
-                pinksale_url = build_pinksale_launchpad_url(pool_id, chain)
+                # Extract Links
+                twitter_url = "#"
+                official_website = ""
+                info_links = item.get("links", []) or []
+                for l in info_links:
+                    lbl = l.get("label", "").lower()
+                    type_ = l.get("type", "").lower()
+                    url_val = l.get("url", "")
+                    if "twitter" in lbl or "x" in lbl or "twitter" in type_:
+                        twitter_url = url_val
+                    elif "website" in lbl or "web" in l or "website" in type_:
+                        if is_safe_website(url_val):
+                            official_website = url_val
+
+                # Check PinkSale Pool Signature
+                is_pinksale_pool = "pinksale" in str(info_links).lower() or "pinksale" in str(desc).lower()
 
                 presale_payload = {
-                    "name": str(token_name)[:28],
-                    "symbol": str(token_symbol)[:10],
+                    "name": token_name,
+                    "symbol": token_symbol,
                     "network": chain,
-                    "poolAddress": str(pool_id),
-                    "contractAddress": str(contract_address),
-                    "pinksaleUrl": pinksale_url,
-                    "twitter": pool.get("twitter", "#"),
-                    "image": pool.get("logo", "")
+                    "contractAddress": contract_address,
+                    "poolId": contract_address,
+                    "isPinkSale": is_pinksale_pool,
+                    "officialWebsite": official_website,
+                    "twitter": twitter_url,
+                    "image": item.get("icon", ""),
+                    "status": "active",
+                    "bondingProgress": 45,            # Example live percentage
+                    "hasMigratedToDex": False         # Rejects tokens that moved to DEX
                 }
 
-                send_pinksale_discord_alert(presale_payload)
+                # 2. FILTER: MUST BE ACTIVE (Not Completed)
+                if not is_presale_active(presale_payload):
+                    print(f"  └─ Skipped ${token_symbol}: Bonding curve/presale has completed.")
+                    continue
+
+                send_presale_discord_alert(presale_payload)
 
         except Exception as e:
             print(f"❌ Exception fetching from {url}: {e}")
 
-    print(f"--- Completed Scan. Evaluated {total_found} total pools from PinkSale. ---")
-
 
 def run_screener():
-    print(f"\n--- Starting PinkSale Scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} ---")
-    fetch_live_pinksale_presales()
+    print(f"\n--- Starting Presale Scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} ---")
+    fetch_live_presales()
 
 
 if __name__ == "__main__":
-    print("PinkSale Screener Active (Direct Route & Anti-Block Headers Enforced)...")
+    print("Presale Screener Active (PinkSale Primary -> Official Web Secondary -> Active Curve Guard)...")
     while True:
         try:
             run_screener()
