@@ -1,9 +1,12 @@
 services:
   - type: worker
-    name: presale-tracker
+    name: presale-breakout-screener
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python presale_tracker.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python presale_tracker.py"
+    autoDeploy: true
     envVars:
-      - key: DISCORD_PRESALE_WEBHOOK_URL
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
         sync: false
