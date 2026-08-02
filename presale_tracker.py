@@ -1,70 +1,26 @@
 import os
 import time
 from datetime import datetime, timezone
-import requests
-from web3 import Web3
+import cloudscraper
 
-# Discord Webhook Environment Variable
+# Environment Variable for Discord Webhook
 DISCORD_PRESALE_WEBHOOK_URL = os.getenv("DISCORD_PRESALE_WEBHOOK_URL")
 
-# Public Multi-Chain RPC Nodes (Bypasses Cloudflare 100%)
-RPC_NODES = {
-    "BSC": "https://bsc-dataseed1.binance.org/",
-    "ETH": "https://cloudflare-eth.com"
-}
-
-# Tracking Caches
-ALERTED_POOLS_CACHE = {}      # { pool_address: timestamp }
+# Tracking Caches to prevent duplicate posts
+ALERTED_POOLS_CACHE = {}      # { pool_id: timestamp }
 ALERTED_SYMBOLS_CACHE = {}    # { symbol: timestamp }
-PRESALE_COOLDOWN_SECONDS = 24 * 3600  # 24-hour deduplication window
+PRESALE_COOLDOWN_SECONDS = 24 * 3600  # 24-hour cooldown
 
-# Minimal PinkSale Presale Pool Smart Contract ABI
-PINKSALE_POOL_ABI = [
-    {
-        "inputs": [],
-        "name": "poolSettings",
-        "outputs": [
-            {"name": "token", "type": "address"},
-            {"name": "currency", "type": "address"},
-            {"name": "startTime", "type": "uint256"},
-            {"name": "endTime", "type": "uint256"},
-            {"name": "softCap", "type": "uint256"},
-            {"name": "hardCap", "type": "uint256"}
-        ],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "totalRaised",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function"
+# Initialize Cloudscraper session with standard desktop browser signature
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
     }
-]
-
-# Minimal ERC-20 Token ABI for Name & Symbol
-ERC20_ABI = [
-    {
-        "inputs": [],
-        "name": "name",
-        "outputs": [{"name": "", "type": "string"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "symbol",
-        "outputs": [{"name": "", "type": "string"}],
-        "stateMutability": "view",
-        "type": "function"
-    }
-]
+)
 
 
-# ---------------------------------------------------------------------------
-# Cache Cleanup & Safety Utilities
-# ---------------------------------------------------------------------------
 def clean_caches():
     """Purges expired items from cache."""
     now = time.time()
@@ -77,48 +33,73 @@ def clean_caches():
             del ALERTED_SYMBOLS_CACHE[sym]
 
 
-def is_already_alerted(pool_address, symbol=""):
+def is_already_alerted(pool_id, symbol=""):
     clean_caches()
-    pool_match = str(pool_address).lower() in ALERTED_POOLS_CACHE
+    pool_match = str(pool_id).lower() in ALERTED_POOLS_CACHE
     symbol_match = str(symbol).upper() in ALERTED_SYMBOLS_CACHE if symbol else False
     return pool_match or symbol_match
 
 
-def record_alerted_presale(pool_address, symbol=""):
-    ALERTED_POOLS_CACHE[str(pool_address).lower()] = time.time()
+def record_alerted_presale(pool_id, symbol=""):
+    ALERTED_POOLS_CACHE[str(pool_id).lower()] = time.time()
     if symbol:
         ALERTED_SYMBOLS_CACHE[str(symbol).upper()] = time.time()
 
 
-def build_pinksale_url(pool_address, chain):
-    """Generates direct, verified PinkSale Launchpad URL."""
-    return f"https://www.pinksale.finance/launchpad/{pool_address}?chain={chain.upper()}"
+def build_pinksale_url(pool_id, chain):
+    """Guarantees valid PinkSale Launchpad URL."""
+    c = str(chain).upper()
+    if c in ["ETHEREUM", "ROBINHOOD_ETH"]: c = "ETH"
+    elif c in ["SOLANA"]: c = "SOL"
+    elif c in ["BINANCE", "BNB"]: c = "BSC"
+
+    return f"https://www.pinksale.finance/launchpad/{pool_id}?chain={c}"
 
 
-# ---------------------------------------------------------------------------
-# Discord Alert Dispatcher
-# ---------------------------------------------------------------------------
+def is_hardcap_active(pool_data):
+    """
+    STRICT HARD CAP FILTER:
+    Rejects presales where status is 'filled', 'completed', or 'ended',
+    or where raised funds hit 100% of the Hard Cap.
+    """
+    status = str(pool_data.get("status", "")).lower()
+    if status in ["filled", "completed", "ended", "cancelled", "success"]:
+        return False
+
+    try:
+        raised = float(pool_data.get("totalRaised", 0) or 0)
+        hard_cap = float(pool_data.get("hardCap", 0) or 0)
+        if hard_cap > 0 and raised >= hard_cap:
+            return False  # Presale is filled
+    except Exception:
+        pass
+
+    return True
+
+
 def send_pinksale_discord_alert(presale_data):
     """Dispatches callout directly linking to PinkSale.com."""
     if not DISCORD_PRESALE_WEBHOOK_URL:
-        print("❌ CRITICAL ERROR: DISCORD_PRESALE_WEBHOOK_URL environment variable missing in Render!")
+        print("❌ ERROR: DISCORD_PRESALE_WEBHOOK_URL environment variable is missing!")
         return
 
     pinksale_url = presale_data["pinksaleUrl"]
     net_display = presale_data['network'].upper()
+    if net_display in ["ETHEREUM", "ETH"]:
+        net_display = "ROBINHOOD ETH"
 
     embed = {
         "title": f"🔥 [{net_display}] LIVE PINKSALE PRESALE: ${presale_data['symbol']}",
-        "url": pinksale_url,  # Makes embed title click directly to PinkSale.com
-        "color": 16738816,    # Flame Orange
-        "thumbnail": {"url": "https://www.pinksale.finance/static/media/logo.f081edeb.png"},
+        "url": pinksale_url,
+        "color": 16738816,  # Flame Orange
+        "thumbnail": {"url": presale_data.get("image") or "https://www.pinksale.finance/static/media/logo.f081edeb.png"},
         "fields": [
             {"name": "Token Name", "value": presale_data["name"], "inline": True},
             {"name": "Symbol", "value": f"${presale_data['symbol']}", "inline": True},
             {"name": "Network", "value": net_display, "inline": True},
             {
                 "name": "Hard Cap / Soft Cap",
-                "value": f"🎯 Hard Cap: {presale_data['hardCap']} {presale_data['currency']}\n🛡️ Soft Cap: {presale_data['softCap']} {presale_data['currency']}\n💰 Total Raised: {presale_data['totalRaised']} {presale_data['currency']}",
+                "value": f"🎯 Hard Cap: {presale_data.get('hardCap', 'N/A')} {presale_data.get('currency', '')}\n🛡️ Soft Cap: {presale_data.get('softCap', 'N/A')} {presale_data.get('currency', '')}",
                 "inline": False
             },
             {
@@ -127,129 +108,113 @@ def send_pinksale_discord_alert(presale_data):
                 "inline": False
             },
             {
+                "name": "Project Social (X / Twitter)",
+                "value": f"[View Project Twitter/X Profile]({presale_data.get('twitter')})" if presale_data.get('twitter') and presale_data.get('twitter') != '#' else "None Provided",
+                "inline": False
+            },
+            {
                 "name": "Pool Address",
-                "value": f"`{presale_data['poolAddress']}`",
+                "value": f"`{presale_data['poolId']}`",
                 "inline": False
             }
         ],
-        "footer": {"text": "On-Chain Blockchain Listener • Uncompleted Hard Cap Filtered"},
+        "footer": {"text": "Local Resident Runner • PinkSale Hard Cap Method"},
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
     payload = {"embeds": [embed]}
     try:
-        res = requests.post(DISCORD_PRESALE_WEBHOOK_URL, json=payload, timeout=8)
+        res = scraper.post(DISCORD_PRESALE_WEBHOOK_URL, json=payload, timeout=8)
         if res.status_code in [200, 204]:
-            print(f"✅ PINKSALE ON-CHAIN ALERT SENT: ${presale_data['symbol']} -> {pinksale_url}")
-            record_alerted_presale(presale_data["poolAddress"], presale_data["symbol"])
+            print(f"✅ PINKSALE DISCORD ALERT SENT: ${presale_data['symbol']} -> {pinksale_url}")
+            record_alerted_presale(presale_data["poolId"], presale_data["symbol"])
         else:
             print(f"❌ Discord Post Error ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"❌ Discord Post Exception: {e}")
 
 
-# ---------------------------------------------------------------------------
-# On-Chain Presale Contract Query Engine
-# ---------------------------------------------------------------------------
-def inspect_pinksale_pool_onchain(w3, pool_address, chain_name):
-    """
-    Queries pool smart contract directly via Web3 RPC:
-    - Verifies current total raised vs. Hard Cap.
-    - Ensures presale is active (time window + hard cap incomplete).
-    """
-    try:
-        checksum_pool = Web3.to_checksum_address(pool_address)
-        pool_contract = w3.eth.contract(address=checksum_pool, abi=PINKSALE_POOL_ABI)
+def fetch_pinksale_hardcap_presales():
+    """Queries PinkSale active pool directory using Cloudscraper over local ISP connection."""
+    print("🔍 Fetching Active Hard Cap Presales from PinkSale...")
 
-        # Query pool parameters directly from smart contract state
-        settings = pool_contract.functions.poolSettings().call()
-        total_raised_raw = pool_contract.functions.totalRaised().call()
+    target_chains = ["bsc", "ethereum", "solana", "sol", "eth", "bnb"]
+    
+    endpoints = [
+        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=40&status=active",
+        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=40&status=upcoming"
+    ]
 
-        token_address = settings[0]
-        start_time = settings[2]
-        end_time = settings[3]
-        soft_cap_raw = settings[4]
-        hard_cap_raw = settings[5]
+    found_count = 0
 
-        total_raised = w3.from_wei(total_raised_raw, 'ether')
-        hard_cap = w3.from_wei(hard_cap_raw, 'ether')
-        soft_cap = w3.from_wei(soft_cap_raw, 'ether')
-
-        now_ts = int(time.time())
-
-        # STRICT HARD CAP & TIME FILTER
-        if hard_cap > 0 and total_raised >= hard_cap:
-            print(f"  └─ Skipped Pool {pool_address}: Hard Cap fully reached ({total_raised}/{hard_cap}).")
-            return
-
-        if now_ts > end_time:
-            print(f"  └─ Skipped Pool {pool_address}: Presale time window ended.")
-            return
-
-        # Query Token Name and Symbol from ERC-20 Smart Contract
-        token_contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=ERC20_ABI)
+    for url in endpoints:
         try:
-            token_name = token_contract.functions.name().call()
-            token_symbol = token_contract.functions.symbol().call()
-        except Exception:
-            token_name = "PinkSale Presale Token"
-            token_symbol = "PRESALE"
+            # Execute cloudscraper GET request over local residential network
+            res = scraper.get(url, timeout=15)
+            print(f"  └─ Request {url} -> HTTP Status Code: {res.status_code}")
 
-        pinksale_url = build_pinksale_url(pool_address, chain_name)
-
-        presale_payload = {
-            "poolAddress": pool_address,
-            "name": str(token_name)[:28],
-            "symbol": str(token_symbol)[:10],
-            "network": chain_name,
-            "pinksaleUrl": pinksale_url,
-            "softCap": f"{soft_cap:.2f}",
-            "hardCap": f"{hard_cap:.2f}",
-            "totalRaised": f"{total_raised:.2f}",
-            "currency": "BNB" if chain_name == "BSC" else "ETH"
-        }
-
-        send_pinksale_discord_alert(presale_payload)
-
-    except Exception as e:
-        # Ignore non-pool addresses silently
-        pass
-
-
-def run_onchain_pinksale_scanner():
-    """Loops through active blockchain networks using Web3 RPC nodes."""
-    print("🔍 Executing On-Chain Blockchain Listener for PinkSale Presales...")
-
-    for chain, rpc_url in RPC_NODES.items():
-        try:
-            w3 = Web3(Web3.HTTPProvider(rpc_url))
-            if not w3.is_connected():
-                print(f"⚠️ Could not connect to {chain} RPC node.")
+            if res.status_code != 200:
+                print(f"     ⚠️ Non-200 Status Received. Content Sample: {res.text[:150]}")
                 continue
 
-            print(f"  └─ Connected to {chain} Blockchain (Block #{w3.eth.block_number}).")
+            data = res.json()
+            pools = data.get("docs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
-            # Query recent transaction logs to detect newly active PinkSale pools
-            # You can also supply known pool contract addresses here
-            latest_block = w3.eth.block_number
-            
-            # Example scan loop across recent pool smart contracts
-            print(f"  └─ Successfully scanned {chain} chain state via direct RPC.")
+            for pool in pools:
+                pool_id = pool.get("id") or pool.get("poolAddress")
+                chain = pool.get("chain", "").lower()
+
+                if not pool_id or chain not in target_chains:
+                    continue
+
+                token_obj = pool.get("token", {}) or {}
+                token_symbol = token_obj.get("symbol") or pool.get("symbol") or "PRESALE"
+                token_name = token_obj.get("name") or pool.get("name") or "PinkSale Presale"
+
+                if is_already_alerted(pool_id, token_symbol):
+                    continue
+
+                pinksale_url = build_pinksale_url(pool_id, chain)
+
+                presale_payload = {
+                    "poolId": str(pool_id),
+                    "name": str(token_name)[:28],
+                    "symbol": str(token_symbol)[:10],
+                    "network": chain,
+                    "pinksaleUrl": pinksale_url,
+                    "softCap": pool.get("softCap", "N/A"),
+                    "hardCap": pool.get("hardCap", "N/A"),
+                    "totalRaised": pool.get("totalRaised", 0),
+                    "currency": pool.get("currencySymbol", "BNB"),
+                    "twitter": pool.get("twitter", "#"),
+                    "image": pool.get("logo", ""),
+                    "status": pool.get("status", "active")
+                }
+
+                if not is_hardcap_active(presale_payload):
+                    continue
+
+                send_pinksale_discord_alert(presale_payload)
+                found_count += 1
 
         except Exception as e:
-            print(f"❌ RPC Exception on {chain}: {e}")
+            print(f"❌ Cloudscraper Exception on {url}: {e}")
+
+    print(f"--- Scan Completed. Dispatched {found_count} new PinkSale presales. ---")
 
 
 def run_screener():
-    print(f"\n--- Starting On-Chain Scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} ---")
-    run_onchain_pinksale_scanner()
+    print(f"\n--- Starting PinkSale Scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} ---")
+    fetch_pinksale_hardcap_presales()
 
 
 if __name__ == "__main__":
-    print("PinkSale On-Chain Listener Service Active (100% Cloudflare Proof)...")
+    print("PinkSale Local Screener Active (Running on Residential Network)...")
+    if not DISCORD_PRESALE_WEBHOOK_URL:
+        print("⚠️ WARNING: DISCORD_PRESALE_WEBHOOK_URL environment variable is NOT set locally!")
     while True:
         try:
             run_screener()
         except Exception as e:
             print(f"Loop Exception: {e}")
-        time.sleep(180)  # Scan every 3 minutes
+        time.sleep(120)  # Scan every 2 minutes
