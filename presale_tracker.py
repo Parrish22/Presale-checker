@@ -1,220 +1,403 @@
 import os
-import time
-from datetime import datetime, timezone
-import cloudscraper
+import sys
+import re
+import asyncio
+from datetime import datetime, timezone, timedelta
+import aiohttp
+import discord
+from discord.ext import tasks, commands
 
-# Environment Variable for Discord Webhook
-DISCORD_PRESALE_WEBHOOK_URL = os.getenv("DISCORD_PRESALE_WEBHOOK_URL")
+# Force unbuffered output for real-time Render logging
+sys.stdout.reconfigure(line_buffering=True)
 
-# Tracking Caches to prevent duplicate posts
-ALERTED_POOLS_CACHE = {}      # { pool_id: timestamp }
-ALERTED_SYMBOLS_CACHE = {}    # { symbol: timestamp }
-PRESALE_COOLDOWN_SECONDS = 24 * 3600  # 24-hour cooldown
+# --- CONFIGURATION ---
+DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
-# Initialize Cloudscraper session with standard desktop browser signature
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
-)
+CHAIN_MAP = {
+    "solana": "sol",
+    "bsc": "bsc",
+    "ethereum": "eth",
+    "base": "base"
+}
 
+EXCLUDED_SYMBOLS = {
+    "SOL", "WSOL", "ETH", "WETH", "BNB", "WBNB", "USDC", "USDT", "BTC", "WBTC", "DAI"
+}
 
-def clean_caches():
-    """Purges expired items from cache."""
-    now = time.time()
-    for pool in list(ALERTED_POOLS_CACHE.keys()):
-        if now - ALERTED_POOLS_CACHE[pool] > PRESALE_COOLDOWN_SECONDS:
-            del ALERTED_POOLS_CACHE[pool]
+# Trackers
+callout_cooldowns = {}      # { contract_address: datetime }
+COOLDOWN_HOURS = 6
 
-    for sym in list(ALERTED_SYMBOLS_CACHE.keys()):
-        if now - ALERTED_SYMBOLS_CACHE[sym] > (12 * 3600):
-            del ALERTED_SYMBOLS_CACHE[sym]
+seen_identities = set()     # Permanent Lock: stores (name_lower, symbol_upper)
+tracked_presales = {}      # Presale state memory: { contract_address: dict }
 
-
-def is_already_alerted(pool_id, symbol=""):
-    clean_caches()
-    pool_match = str(pool_id).lower() in ALERTED_POOLS_CACHE
-    symbol_match = str(symbol).upper() in ALERTED_SYMBOLS_CACHE if symbol else False
-    return pool_match or symbol_match
+intents = discord.Intents.default()
+intents.message_content = True 
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def record_alerted_presale(pool_id, symbol=""):
-    ALERTED_POOLS_CACHE[str(pool_id).lower()] = time.time()
-    if symbol:
-        ALERTED_SYMBOLS_CACHE[str(symbol).upper()] = time.time()
+# --- DATA HELPERS & SECURITY ---
 
-
-def build_pinksale_url(pool_id, chain):
-    """Guarantees valid PinkSale Launchpad URL."""
-    c = str(chain).upper()
-    if c in ["ETHEREUM", "ROBINHOOD_ETH"]: c = "ETH"
-    elif c in ["SOLANA"]: c = "SOL"
-    elif c in ["BINANCE", "BNB"]: c = "BSC"
-
-    return f"https://www.pinksale.finance/launchpad/{pool_id}?chain={c}"
-
-
-def is_hardcap_active(pool_data):
-    """
-    STRICT HARD CAP FILTER:
-    Rejects presales where status is 'filled', 'completed', or 'ended',
-    or where raised funds hit 100% of the Hard Cap.
-    """
-    status = str(pool_data.get("status", "")).lower()
-    if status in ["filled", "completed", "ended", "cancelled", "success"]:
-        return False
-
+async def fetch_json(session, url):
+    """Safely fetch JSON from endpoints."""
     try:
-        raised = float(pool_data.get("totalRaised", 0) or 0)
-        hard_cap = float(pool_data.get("hardCap", 0) or 0)
-        if hard_cap > 0 and raised >= hard_cap:
-            return False  # Presale is filled
-    except Exception:
-        pass
-
-    return True
-
-
-def send_pinksale_discord_alert(presale_data):
-    """Dispatches callout directly linking to PinkSale.com."""
-    if not DISCORD_PRESALE_WEBHOOK_URL:
-        print("❌ ERROR: DISCORD_PRESALE_WEBHOOK_URL environment variable is missing!")
-        return
-
-    pinksale_url = presale_data["pinksaleUrl"]
-    net_display = presale_data['network'].upper()
-    if net_display in ["ETHEREUM", "ETH"]:
-        net_display = "ROBINHOOD ETH"
-
-    embed = {
-        "title": f"🔥 [{net_display}] LIVE PINKSALE PRESALE: ${presale_data['symbol']}",
-        "url": pinksale_url,
-        "color": 16738816,  # Flame Orange
-        "thumbnail": {"url": presale_data.get("image") or "https://www.pinksale.finance/static/media/logo.f081edeb.png"},
-        "fields": [
-            {"name": "Token Name", "value": presale_data["name"], "inline": True},
-            {"name": "Symbol", "value": f"${presale_data['symbol']}", "inline": True},
-            {"name": "Network", "value": net_display, "inline": True},
-            {
-                "name": "Hard Cap / Soft Cap",
-                "value": f"🎯 Hard Cap: {presale_data.get('hardCap', 'N/A')} {presale_data.get('currency', '')}\n🛡️ Soft Cap: {presale_data.get('softCap', 'N/A')} {presale_data.get('currency', '')}",
-                "inline": False
-            },
-            {
-                "name": "Direct PinkSale Link",
-                "value": f"👉 **[Click Here to Join Presale on PinkSale.com]({pinksale_url})**",
-                "inline": False
-            },
-            {
-                "name": "Project Social (X / Twitter)",
-                "value": f"[View Project Twitter/X Profile]({presale_data.get('twitter')})" if presale_data.get('twitter') and presale_data.get('twitter') != '#' else "None Provided",
-                "inline": False
-            },
-            {
-                "name": "Pool Address",
-                "value": f"`{presale_data['poolId']}`",
-                "inline": False
-            }
-        ],
-        "footer": {"text": "Local Resident Runner • PinkSale Hard Cap Method"},
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
-
-    payload = {"embeds": [embed]}
-    try:
-        res = scraper.post(DISCORD_PRESALE_WEBHOOK_URL, json=payload, timeout=8)
-        if res.status_code in [200, 204]:
-            print(f"✅ PINKSALE DISCORD ALERT SENT: ${presale_data['symbol']} -> {pinksale_url}")
-            record_alerted_presale(presale_data["poolId"], presale_data["symbol"])
-        else:
-            print(f"❌ Discord Post Error ({res.status_code}): {res.text}")
+        async with session.get(url, timeout=12) as resp:
+            if resp.status == 200:
+                return await resp.json()
     except Exception as e:
-        print(f"❌ Discord Post Exception: {e}")
+        print(f"[HTTP Error] {url}: {e}", flush=True)
+    return None
 
 
-def fetch_pinksale_hardcap_presales():
-    """Queries PinkSale active pool directory using Cloudscraper over local ISP connection."""
-    print("🔍 Fetching Active Hard Cap Presales from PinkSale...")
+async def check_goplus_security(session, chain_id, contract_address):
+    """
+    Checks Honeypot status and Top 10 Holder distribution using GoPlus.
+    Bypasses Solana and handles missing index data safely.
+    """
+    if chain_id == "sol":
+        return {"safe": True, "top10_percent": 0.0}
 
-    target_chains = ["bsc", "ethereum", "solana", "sol", "eth", "bnb"]
+    if not contract_address:
+        return {"safe": False, "top10_percent": 100.0}
+
+    url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={contract_address}"
     
-    endpoints = [
-        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=40&status=active",
-        "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=40&status=upcoming"
-    ]
+    try:
+        data = await fetch_json(session, url)
+        if not data or not isinstance(data, dict):
+            return {"safe": True, "top10_percent": 0.0}
+            
+        result_map = data.get("result")
+        if not result_map or not isinstance(result_map, dict):
+            return {"safe": True, "top10_percent": 0.0}
 
-    found_count = 0
+        res = result_map.get(contract_address.lower())
+        if not res or not isinstance(res, dict):
+            return {"safe": True, "top10_percent": 0.0}
+        
+        is_honeypot = str(res.get("is_honeypot", "0")) == "1"
+        cannot_sell = str(res.get("cannot_sell_all", "0")) == "1"
+        if is_honeypot or cannot_sell:
+            return {"safe": False, "top10_percent": 100.0}
 
-    for url in endpoints:
-        try:
-            # Execute cloudscraper GET request over local residential network
-            res = scraper.get(url, timeout=15)
-            print(f"  └─ Request {url} -> HTTP Status Code: {res.status_code}")
+        holders = res.get("holders", [])
+        if not isinstance(holders, list) or len(holders) == 0:
+            return {"safe": True, "top10_percent": 0.0}
 
-            if res.status_code != 200:
-                print(f"     ⚠️ Non-200 Status Received. Content Sample: {res.text[:150]}")
+        top10_percent = 0.0
+        for holder in holders[:10]:
+            if isinstance(holder, dict):
+                try:
+                    top10_percent += float(holder.get("percent", 0)) * 100
+                except (ValueError, TypeError):
+                    pass
+
+        return {"safe": top10_percent < 80.0, "top10_percent": top10_percent}
+        
+    except Exception as e:
+        print(f"[GoPlus Exception] {e}", flush=True)
+        return {"safe": True, "top10_percent": 0.0}
+
+
+# --- PRESALE LINK EXTRACTION & PRIORITIZATION ---
+
+def parse_presale_links(websites, socials):
+    """
+    Priority Rules:
+    1. Primary: Official Website / Custom Presale Link. If none, PinkSale becomes primary.
+    2. Secondary: PinkSale Link (if an official link took primary slot).
+    """
+    official_website = None
+    custom_presale_link = None
+    pinksale_link = None
+    twitter_link = None
+
+    if isinstance(websites, list):
+        for site in websites:
+            if not isinstance(site, dict): continue
+            url = site.get("url", "")
+            if not url: continue
+
+            url_lower = url.lower()
+            if "pinksale.finance" in url_lower or "pinksale.com" in url_lower:
+                pinksale_link = url
+            elif any(kw in url_lower for kw in ["/presale", "presale.", "/ico", "/launchpad", "/seed"]):
+                custom_presale_link = url
+            elif not official_website:
+                official_website = url
+
+    if isinstance(socials, list):
+        for s in socials:
+            if not isinstance(s, dict): continue
+            url = s.get("url", "")
+            if ("twitter" in s.get("type", "").lower() or "x.com" in url.lower()) and not twitter_link:
+                twitter_link = url
+            elif ("pinksale" in url.lower()) and not pinksale_link:
+                pinksale_link = url
+
+    primary_presale = None
+    secondary_presale = None
+
+    if custom_presale_link:
+        primary_presale = ("Primary Presale", custom_presale_link)
+        if pinksale_link:
+            secondary_presale = ("Secondary Presale (PinkSale)", pinksale_link)
+    elif pinksale_link:
+        primary_presale = ("Primary Presale (PinkSale)", pinksale_link)
+
+    return {
+        "website": official_website,
+        "twitter": twitter_link,
+        "primary_presale": primary_presale,      # Tuple: (Label, URL) or None
+        "secondary_presale": secondary_presale   # Tuple: (Label, URL) or None
+    }
+
+
+# --- CORE SCREENER & TRACKER ---
+
+async def screen_tokens():
+    alerts = []
+    pairs_to_evaluate = []
+    
+    async with aiohttp.ClientSession() as session:
+        current_time = datetime.now(timezone.utc)
+
+        # 1. Fetch raw token updates from DexScreener
+        profiles = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
+        latest_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/latest/v1")
+        top_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/top/v1")
+        
+        candidate_items = []
+        if isinstance(profiles, list): candidate_items.extend(profiles)
+        if isinstance(latest_boosts, list): candidate_items.extend(latest_boosts)
+        if isinstance(top_boosts, list): candidate_items.extend(top_boosts)
+
+        seen_token_addrs = set()
+        token_requests = []
+        
+        for item in candidate_items:
+            if not isinstance(item, dict): continue
+            chain = str(item.get("chainId", "")).lower()
+            token_addr = item.get("tokenAddress")
+            
+            if chain in CHAIN_MAP and token_addr and (chain, token_addr) not in seen_token_addrs:
+                seen_token_addrs.add((chain, token_addr))
+                token_requests.append((chain, token_addr))
+
+        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Discovered {len(token_requests)} active tokens. Hydrating market data...", flush=True)
+
+        for chain, token_addr in token_requests:
+            p_data = await fetch_json(session, f"https://api.dexscreener.com/tokens/v1/{chain}/{token_addr}")
+            if isinstance(p_data, list):
+                pairs_to_evaluate.extend(p_data)
+
+        evaluated_contracts = set()
+
+        for pair in pairs_to_evaluate:
+            if not isinstance(pair, dict): continue
+
+            base_token = pair.get("baseToken", {})
+            if not isinstance(base_token, dict): continue
+
+            contract = base_token.get("address")
+            raw_name = str(base_token.get("name", "Unknown Token")).strip()
+            raw_symbol = str(base_token.get("symbol", "")).upper().strip()
+            chain = str(pair.get("chainId", "")).lower()
+            
+            if not contract or chain not in CHAIN_MAP or contract in evaluated_contracts:
+                continue
+            if raw_symbol in EXCLUDED_SYMBOLS:
                 continue
 
-            data = res.json()
-            pools = data.get("docs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            evaluated_contracts.add(contract)
 
-            for pool in pools:
-                pool_id = pool.get("id") or pool.get("poolAddress")
-                chain = pool.get("chain", "").lower()
+            # 1. PERMANENT IDENTITY LOCK (Name + Symbol)
+            identity_key = (raw_name.lower(), raw_symbol)
+            if identity_key in seen_identities:
+                continue
 
-                if not pool_id or chain not in target_chains:
-                    continue
+            # 2. 6-HOUR CONTRACT COOLDOWN
+            last_call = callout_cooldowns.get(contract)
+            if last_call and (current_time - last_call) < timedelta(hours=COOLDOWN_HOURS):
+                continue
 
-                token_obj = pool.get("token", {}) or {}
-                token_symbol = token_obj.get("symbol") or pool.get("symbol") or "PRESALE"
-                token_name = token_obj.get("name") or pool.get("name") or "PinkSale Presale"
+            # 3. BREAKOUT METRICS
+            volume_data = pair.get("volume", {}) or {}
+            price_change_data = pair.get("priceChange", {}) or {}
+            txns_data = (pair.get("txns", {}) or {}).get("m5", {}) or {}
 
-                if is_already_alerted(pool_id, token_symbol):
-                    continue
+            vol_surge_5m = float(volume_data.get("m5", 0) or 0)
+            price_change_5m = float(price_change_data.get("m5", 0) or 0)
+            buys_5m = int(txns_data.get("buys", 0) or 0)
+            sells_5m = int(txns_data.get("sells", 0) or 0)
 
-                pinksale_url = build_pinksale_url(pool_id, chain)
+            if vol_surge_5m < 1000.0 or price_change_5m < 2.0 or buys_5m <= sells_5m:
+                continue
 
-                presale_payload = {
-                    "poolId": str(pool_id),
-                    "name": str(token_name)[:28],
-                    "symbol": str(token_symbol)[:10],
-                    "network": chain,
-                    "pinksaleUrl": pinksale_url,
-                    "softCap": pool.get("softCap", "N/A"),
-                    "hardCap": pool.get("hardCap", "N/A"),
-                    "totalRaised": pool.get("totalRaised", 0),
-                    "currency": pool.get("currencySymbol", "BNB"),
-                    "twitter": pool.get("twitter", "#"),
-                    "image": pool.get("logo", ""),
-                    "status": pool.get("status", "active")
-                }
+            # 4. GO-PLUS SECURITY
+            goplus_chain = "1" if chain == "ethereum" else ("56" if chain == "bsc" else chain)
+            security = await check_goplus_security(session, goplus_chain, contract)
+            if not security["safe"]:
+                continue
 
-                if not is_hardcap_active(presale_payload):
-                    continue
+            # Parse Links with Presale Prioritization
+            info = pair.get("info", {}) or {}
+            link_data = parse_presale_links(info.get("websites", []), info.get("socials", []))
 
-                send_pinksale_discord_alert(presale_payload)
-                found_count += 1
+            # Calculate Display Age
+            pair_created = pair.get("pairCreatedAt")
+            age_display = f"{((current_time - datetime.fromtimestamp(pair_created / 1000, tz=timezone.utc)).total_seconds() / 86400.0):.1f} Days" if pair_created else "0.0 Days"
 
+            display_network = "Robinhood ETH" if chain == "ethereum" else chain.upper()
+
+            # Determine Event Status Lifecycle
+            event_type = "BREAKOUT"
+            if link_data["primary_presale"]:
+                event_type = "PRESALE_ACTIVE"
+
+            alert_data = {
+                "event_type": event_type,
+                "name": raw_name,
+                "symbol": f"${raw_symbol}",
+                "network": display_network,
+                "price": pair.get("priceUsd", "0.00"),
+                "vol_surge_5m": vol_surge_5m,
+                "vol_24h": volume_data.get("h24", 0),
+                "price_change_5m": price_change_5m,
+                "liquidity": pair.get("liquidity", {}).get("usd", 0),
+                "buys_5m": buys_5m,
+                "sells_5m": sells_5m,
+                "age_days": age_display,
+                "photo": info.get("imageUrl"),
+                "contract": contract,
+                "gmgn_link": f"https://gmgn.ai/{CHAIN_MAP[chain]}/token/{contract}",
+                "link_data": link_data,
+                "identity_key": identity_key
+            }
+            
+            alerts.append(alert_data)
+
+    return alerts
+
+
+# --- DISCORD BROADCASTING ENGINE ---
+
+@tasks.loop(minutes=5)
+async def tracker_loop():
+    print(f"\n=========================================", flush=True)
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Presale & Breakout Scan...", flush=True)
+    print(f"=========================================", flush=True)
+    
+    channel = bot.get_channel(CHANNEL_ID)
+    if not channel:
+        print(f"[Error] Discord Channel ID {CHANNEL_ID} inaccessible.", flush=True)
+        return
+
+    alerts = await screen_tokens()
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scan complete. Found {len(alerts)} items.", flush=True)
+    
+    current_time = datetime.now(timezone.utc)
+
+    for alert in alerts:
+        ld = alert["link_data"]
+        
+        # Dynamic Title Formatting
+        if alert["event_type"] == "PRESALE_ACTIVE":
+            embed_title = f"🚨 Presale Alert! | [{alert['network']}] {alert['symbol']}"
+            color = discord.Color.gold()
+        else:
+            embed_title = f"Breakout Detected! | [{alert['network']}] {alert['symbol']}"
+            color = discord.Color.red()
+
+        embed = discord.Embed(
+            title=embed_title,
+            color=color,
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        photo_url = alert.get("photo")
+        if photo_url and isinstance(photo_url, str) and photo_url.startswith(("http://", "https://")):
+            embed.set_thumbnail(url=photo_url)
+
+        # Row 1
+        embed.add_field(name="Token Name", value=alert["name"], inline=True)
+        embed.add_field(name="Symbol", value=alert["symbol"], inline=True)
+        embed.add_field(name="Network", value=alert["network"], inline=True)
+
+        # Row 2
+        try:
+            p_val = float(alert["price"])
+            p_fmt = f"${p_val:.8f}".rstrip('0').rstrip('.') if p_val < 0.01 else f"${p_val:,.4f}"
+        except (ValueError, TypeError):
+            p_fmt = f"${alert['price']}"
+
+        try:
+            surge_5m = f"${float(alert['vol_surge_5m']):,.2f}"
+        except (ValueError, TypeError):
+            surge_5m = f"${alert['vol_surge_5m']}"
+
+        try:
+            vol_24h = f"${float(alert['vol_24h']):,.2f}"
+        except (ValueError, TypeError):
+            vol_24h = f"${alert['vol_24h']}"
+
+        embed.add_field(name="Price USD", value=p_fmt, inline=True)
+        embed.add_field(name="5m Volume Surge", value=surge_5m, inline=True)
+        embed.add_field(name="24h Volume", value=vol_24h, inline=True)
+
+        # Row 3
+        try:
+            pct_val = float(alert["price_change_5m"])
+            pct_fmt = f"+{pct_val:.2f}%" if pct_val >= 0 else f"{pct_val:.2f}%"
+        except (ValueError, TypeError):
+            pct_fmt = f"{alert['price_change_5m']}%"
+
+        try:
+            liq_fmt = f"${float(alert['liquidity']):,.2f}"
+        except (ValueError, TypeError):
+            liq_fmt = f"${alert['liquidity']}"
+
+        embed.add_field(name="5m Price Change", value=pct_fmt, inline=True)
+        embed.add_field(name="Liquidity", value=liq_fmt, inline=True)
+        embed.add_field(name="5m Buy/Sell Ratio", value=f"🟢 {alert['buys_5m']} / 🔴 {alert['sells_5m']}", inline=True)
+
+        # Row 4
+        embed.add_field(name="Age", value=alert["age_days"], inline=False)
+
+        # Row 5: Presale Links & Socials
+        links_list = []
+        if ld["primary_presale"]:
+            links_list.append(f"[{ld['primary_presale'][0]}]({ld['primary_presale'][1]})")
+        if ld["secondary_presale"]:
+            links_list.append(f"[{ld['secondary_presale'][0]}]({ld['secondary_presale'][1]})")
+        if ld["website"]:
+            links_list.append(f"[Website]({ld['website']})")
+        if ld["twitter"]:
+            links_list.append(f"[Twitter/X]({ld['twitter']})")
+
+        embed.add_field(name="Official & Presale Links", value=" | ".join(links_list) if links_list else "None", inline=False)
+
+        # Row 6 & 7
+        embed.add_field(name="Trade on GMGN", value=f"👈 [Open GMGN Live Chart]({alert['gmgn_link']})", inline=False)
+        embed.add_field(name="Contract Address", value=f"`{alert['contract']}`", inline=False)
+
+        embed.set_footer(text="Pro Presale & Breakout Screener • 6h Deduplication Active")
+
+        try:
+            await channel.send(embed=embed)
+            callout_cooldowns[alert["contract"]] = current_time
+            seen_identities.add(alert["identity_key"])
+            print(f"[Discord] Sent alert for {alert['symbol']} ({alert['name']})", flush=True)
         except Exception as e:
-            print(f"❌ Cloudscraper Exception on {url}: {e}")
-
-    print(f"--- Scan Completed. Dispatched {found_count} new PinkSale presales. ---")
+            print(f"[Discord Send Error] {e}", flush=True)
 
 
-def run_screener():
-    print(f"\n--- Starting PinkSale Scan at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} ---")
-    fetch_pinksale_hardcap_presales()
-
+@bot.event
+async def on_ready():
+    print(f"Logged in successfully as {bot.user.name}", flush=True)
+    if not tracker_loop.is_running():
+        tracker_loop.start()
 
 if __name__ == "__main__":
-    print("PinkSale Local Screener Active (Running on Residential Network)...")
-    if not DISCORD_PRESALE_WEBHOOK_URL:
-        print("⚠️ WARNING: DISCORD_PRESALE_WEBHOOK_URL environment variable is NOT set locally!")
-    while True:
-        try:
-            run_screener()
-        except Exception as e:
-            print(f"Loop Exception: {e}")
-        time.sleep(120)  # Scan every 2 minutes
+    bot.run(DISCORD_TOKEN)
