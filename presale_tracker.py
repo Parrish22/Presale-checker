@@ -1,6 +1,5 @@
 import os
 import sys
-import re
 import asyncio
 from datetime import datetime, timezone, timedelta
 import aiohttp
@@ -25,12 +24,10 @@ EXCLUDED_SYMBOLS = {
     "SOL", "WSOL", "ETH", "WETH", "BNB", "WBNB", "USDC", "USDT", "BTC", "WBTC", "DAI"
 }
 
-# Trackers
+# Cooldowns and Identity Locking
 callout_cooldowns = {}      # { contract_address: datetime }
 COOLDOWN_HOURS = 6
-
 seen_identities = set()     # Permanent Lock: stores (name_lower, symbol_upper)
-tracked_presales = {}      # Presale state memory: { contract_address: dict }
 
 intents = discord.Intents.default()
 intents.message_content = True 
@@ -40,7 +37,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # --- DATA HELPERS & SECURITY ---
 
 async def fetch_json(session, url):
-    """Safely fetch JSON from endpoints."""
+    """Safely fetch JSON from API endpoints."""
     try:
         async with session.get(url, timeout=12) as resp:
             if resp.status == 200:
@@ -52,14 +49,11 @@ async def fetch_json(session, url):
 
 async def check_goplus_security(session, chain_id, contract_address):
     """
-    Checks Honeypot status and Top 10 Holder distribution using GoPlus.
-    Bypasses Solana and handles missing index data safely.
+    Checks Honeypot status and Top 10 Holder distribution using GoPlus Security API.
+    Bypasses Solana and handles unindexed contracts safely.
     """
-    if chain_id == "sol":
+    if chain_id == "sol" or not contract_address:
         return {"safe": True, "top10_percent": 0.0}
-
-    if not contract_address:
-        return {"safe": False, "top10_percent": 100.0}
 
     url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={contract_address}"
     
@@ -102,11 +96,11 @@ async def check_goplus_security(session, chain_id, contract_address):
 
 # --- PRESALE LINK EXTRACTION & PRIORITIZATION ---
 
-def parse_presale_links(websites, socials):
+def parse_presale_links(websites, socials, description=""):
     """
-    Priority Rules:
-    1. Primary: Official Website / Custom Presale Link. If none, PinkSale becomes primary.
-    2. Secondary: PinkSale Link (if an official link took primary slot).
+    Identifies and prioritizes Presale URLs:
+    1. Primary: Official Presale / Custom Launchpad URL. If missing, PinkSale is Primary.
+    2. Secondary: PinkSale URL (if an official presale URL took the primary slot).
     """
     official_website = None
     custom_presale_link = None
@@ -116,13 +110,13 @@ def parse_presale_links(websites, socials):
     if isinstance(websites, list):
         for site in websites:
             if not isinstance(site, dict): continue
-            url = site.get("url", "")
+            url = site.get("url", "").strip()
             if not url: continue
 
             url_lower = url.lower()
             if "pinksale.finance" in url_lower or "pinksale.com" in url_lower:
                 pinksale_link = url
-            elif any(kw in url_lower for kw in ["/presale", "presale.", "/ico", "/launchpad", "/seed"]):
+            elif any(kw in url_lower for kw in ["/presale", "presale.", "/ico", "/launchpad", "/seed", "fairlaunch"]):
                 custom_presale_link = url
             elif not official_website:
                 official_website = url
@@ -130,11 +124,17 @@ def parse_presale_links(websites, socials):
     if isinstance(socials, list):
         for s in socials:
             if not isinstance(s, dict): continue
-            url = s.get("url", "")
+            url = s.get("url", "").strip()
             if ("twitter" in s.get("type", "").lower() or "x.com" in url.lower()) and not twitter_link:
                 twitter_link = url
             elif ("pinksale" in url.lower()) and not pinksale_link:
                 pinksale_link = url
+
+    # Parse description text for PinkSale or Presale links if not found in metadata lists
+    if not pinksale_link and ("pinksale.finance" in description.lower() or "pinksale.com" in description.lower()):
+        match = re.search(r'https?://[^\s]*pinksale\.[^\s]+', description, re.IGNORECASE)
+        if match:
+            pinksale_link = match.group(0)
 
     primary_presale = None
     secondary_presale = None
@@ -154,16 +154,16 @@ def parse_presale_links(websites, socials):
     }
 
 
-# --- CORE SCREENER & TRACKER ---
+# --- PRESALE-ONLY SCREENER ---
 
-async def screen_tokens():
+async def screen_presales():
+    """Screens new profiles and launchpad items EXCLUSIVELY for active/upcoming Presales."""
     alerts = []
-    pairs_to_evaluate = []
     
     async with aiohttp.ClientSession() as session:
         current_time = datetime.now(timezone.utc)
 
-        # 1. Fetch raw token updates from DexScreener
+        # Fetch live token profiles and boosted listings (primary sources for presales)
         profiles = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
         latest_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/latest/v1")
         top_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/top/v1")
@@ -173,107 +173,76 @@ async def screen_tokens():
         if isinstance(latest_boosts, list): candidate_items.extend(latest_boosts)
         if isinstance(top_boosts, list): candidate_items.extend(top_boosts)
 
-        seen_token_addrs = set()
-        token_requests = []
-        
-        for item in candidate_items:
-            if not isinstance(item, dict): continue
-            chain = str(item.get("chainId", "")).lower()
-            token_addr = item.get("tokenAddress")
-            
-            if chain in CHAIN_MAP and token_addr and (chain, token_addr) not in seen_token_addrs:
-                seen_token_addrs.add((chain, token_addr))
-                token_requests.append((chain, token_addr))
-
-        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Discovered {len(token_requests)} active tokens. Hydrating market data...", flush=True)
-
-        for chain, token_addr in token_requests:
-            p_data = await fetch_json(session, f"https://api.dexscreener.com/tokens/v1/{chain}/{token_addr}")
-            if isinstance(p_data, list):
-                pairs_to_evaluate.extend(p_data)
+        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Discovered {len(candidate_items)} potential presale profiles. Evaluating...", flush=True)
 
         evaluated_contracts = set()
 
-        for pair in pairs_to_evaluate:
-            if not isinstance(pair, dict): continue
+        for item in candidate_items:
+            if not isinstance(item, dict): continue
 
-            base_token = pair.get("baseToken", {})
-            if not isinstance(base_token, dict): continue
-
-            contract = base_token.get("address")
-            raw_name = str(base_token.get("name", "Unknown Token")).strip()
-            raw_symbol = str(base_token.get("symbol", "")).upper().strip()
-            chain = str(pair.get("chainId", "")).lower()
+            chain = str(item.get("chainId", "")).lower()
+            contract = item.get("tokenAddress")
             
-            if not contract or chain not in CHAIN_MAP or contract in evaluated_contracts:
+            if chain not in CHAIN_MAP or not contract or contract in evaluated_contracts:
                 continue
-            if raw_symbol in EXCLUDED_SYMBOLS:
+
+            # Extract basic info from profile item
+            description = item.get("description", "")
+            links = item.get("links", [])
+            icon_url = item.get("icon")
+
+            # Parse presale links
+            link_data = parse_presale_links(links, links, description)
+
+            # --- STRICT PRESALE FILTER ---
+            # If NO presale link (PinkSale or Custom Presale) is found, SKIP IT!
+            if not link_data["primary_presale"]:
                 continue
 
             evaluated_contracts.add(contract)
 
+            # Hydrate full token pair data if available
+            p_data = await fetch_json(session, f"https://api.dexscreener.com/tokens/v1/{chain}/{contract}")
+            pair_info = p_data[0] if isinstance(p_data, list) and len(p_data) > 0 else {}
+
+            base_token = pair_info.get("baseToken", {}) if isinstance(pair_info, dict) else {}
+            raw_name = base_token.get("name") or item.get("header") or "Unknown Presale Token"
+            raw_symbol = str(base_token.get("symbol") or "TOKEN").upper().strip()
+
+            if raw_symbol in EXCLUDED_SYMBOLS:
+                continue
+
             # 1. PERMANENT IDENTITY LOCK (Name + Symbol)
-            identity_key = (raw_name.lower(), raw_symbol)
+            identity_key = (str(raw_name).lower().strip(), raw_symbol)
             if identity_key in seen_identities:
+                print(f"  [Skip] {raw_name} (${raw_symbol}): Already alerted previously.", flush=True)
                 continue
 
             # 2. 6-HOUR CONTRACT COOLDOWN
             last_call = callout_cooldowns.get(contract)
             if last_call and (current_time - last_call) < timedelta(hours=COOLDOWN_HOURS):
+                print(f"  [Skip] {raw_symbol} ({contract[:6]}...): Under 6-hour cooldown.", flush=True)
                 continue
 
-            # 3. BREAKOUT METRICS
-            volume_data = pair.get("volume", {}) or {}
-            price_change_data = pair.get("priceChange", {}) or {}
-            txns_data = (pair.get("txns", {}) or {}).get("m5", {}) or {}
-
-            vol_surge_5m = float(volume_data.get("m5", 0) or 0)
-            price_change_5m = float(price_change_data.get("m5", 0) or 0)
-            buys_5m = int(txns_data.get("buys", 0) or 0)
-            sells_5m = int(txns_data.get("sells", 0) or 0)
-
-            if vol_surge_5m < 1000.0 or price_change_5m < 2.0 or buys_5m <= sells_5m:
-                continue
-
-            # 4. GO-PLUS SECURITY
+            # 3. SECURITY CHECK
             goplus_chain = "1" if chain == "ethereum" else ("56" if chain == "bsc" else chain)
             security = await check_goplus_security(session, goplus_chain, contract)
             if not security["safe"]:
+                print(f"  [Skip] {raw_name} ({contract[:6]}...): Failed security check.", flush=True)
                 continue
-
-            # Parse Links with Presale Prioritization
-            info = pair.get("info", {}) or {}
-            link_data = parse_presale_links(info.get("websites", []), info.get("socials", []))
-
-            # Calculate Display Age
-            pair_created = pair.get("pairCreatedAt")
-            age_display = f"{((current_time - datetime.fromtimestamp(pair_created / 1000, tz=timezone.utc)).total_seconds() / 86400.0):.1f} Days" if pair_created else "0.0 Days"
 
             display_network = "Robinhood ETH" if chain == "ethereum" else chain.upper()
 
-            # Determine Event Status Lifecycle
-            event_type = "BREAKOUT"
-            if link_data["primary_presale"]:
-                event_type = "PRESALE_ACTIVE"
-
             alert_data = {
-                "event_type": event_type,
                 "name": raw_name,
                 "symbol": f"${raw_symbol}",
                 "network": display_network,
-                "price": pair.get("priceUsd", "0.00"),
-                "vol_surge_5m": vol_surge_5m,
-                "vol_24h": volume_data.get("h24", 0),
-                "price_change_5m": price_change_5m,
-                "liquidity": pair.get("liquidity", {}).get("usd", 0),
-                "buys_5m": buys_5m,
-                "sells_5m": sells_5m,
-                "age_days": age_display,
-                "photo": info.get("imageUrl"),
+                "photo": icon_url or (pair_info.get("info", {}).get("imageUrl") if isinstance(pair_info, dict) else None),
                 "contract": contract,
                 "gmgn_link": f"https://gmgn.ai/{CHAIN_MAP[chain]}/token/{contract}",
                 "link_data": link_data,
-                "identity_key": identity_key
+                "identity_key": identity_key,
+                "description": description[:250] if description else "No description provided."
             }
             
             alerts.append(alert_data)
@@ -286,7 +255,7 @@ async def screen_tokens():
 @tasks.loop(minutes=5)
 async def tracker_loop():
     print(f"\n=========================================", flush=True)
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Presale & Breakout Scan...", flush=True)
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Presale-Only Scan...", flush=True)
     print(f"=========================================", flush=True)
     
     channel = bot.get_channel(CHANNEL_ID)
@@ -294,25 +263,19 @@ async def tracker_loop():
         print(f"[Error] Discord Channel ID {CHANNEL_ID} inaccessible.", flush=True)
         return
 
-    alerts = await screen_tokens()
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scan complete. Found {len(alerts)} items.", flush=True)
+    alerts = await screen_presales()
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scan complete. Found {len(alerts)} verified presale tokens.", flush=True)
     
     current_time = datetime.now(timezone.utc)
 
     for alert in alerts:
         ld = alert["link_data"]
         
-        # Dynamic Title Formatting
-        if alert["event_type"] == "PRESALE_ACTIVE":
-            embed_title = f"🚨 Presale Alert! | [{alert['network']}] {alert['symbol']}"
-            color = discord.Color.gold()
-        else:
-            embed_title = f"Breakout Detected! | [{alert['network']}] {alert['symbol']}"
-            color = discord.Color.red()
-
+        embed_title = f"🚨 New Presale Alert! | [{alert['network']}] {alert['symbol']}"
+        
         embed = discord.Embed(
             title=embed_title,
-            color=color,
+            color=discord.Color.gold(),
             timestamp=datetime.now(timezone.utc)
         )
 
@@ -320,75 +283,43 @@ async def tracker_loop():
         if photo_url and isinstance(photo_url, str) and photo_url.startswith(("http://", "https://")):
             embed.set_thumbnail(url=photo_url)
 
-        # Row 1
+        # Row 1: Token Details
         embed.add_field(name="Token Name", value=alert["name"], inline=True)
         embed.add_field(name="Symbol", value=alert["symbol"], inline=True)
         embed.add_field(name="Network", value=alert["network"], inline=True)
 
-        # Row 2
-        try:
-            p_val = float(alert["price"])
-            p_fmt = f"${p_val:.8f}".rstrip('0').rstrip('.') if p_val < 0.01 else f"${p_val:,.4f}"
-        except (ValueError, TypeError):
-            p_fmt = f"${alert['price']}"
-
-        try:
-            surge_5m = f"${float(alert['vol_surge_5m']):,.2f}"
-        except (ValueError, TypeError):
-            surge_5m = f"${alert['vol_surge_5m']}"
-
-        try:
-            vol_24h = f"${float(alert['vol_24h']):,.2f}"
-        except (ValueError, TypeError):
-            vol_24h = f"${alert['vol_24h']}"
-
-        embed.add_field(name="Price USD", value=p_fmt, inline=True)
-        embed.add_field(name="5m Volume Surge", value=surge_5m, inline=True)
-        embed.add_field(name="24h Volume", value=vol_24h, inline=True)
-
-        # Row 3
-        try:
-            pct_val = float(alert["price_change_5m"])
-            pct_fmt = f"+{pct_val:.2f}%" if pct_val >= 0 else f"{pct_val:.2f}%"
-        except (ValueError, TypeError):
-            pct_fmt = f"{alert['price_change_5m']}%"
-
-        try:
-            liq_fmt = f"${float(alert['liquidity']):,.2f}"
-        except (ValueError, TypeError):
-            liq_fmt = f"${alert['liquidity']}"
-
-        embed.add_field(name="5m Price Change", value=pct_fmt, inline=True)
-        embed.add_field(name="Liquidity", value=liq_fmt, inline=True)
-        embed.add_field(name="5m Buy/Sell Ratio", value=f"🟢 {alert['buys_5m']} / 🔴 {alert['sells_5m']}", inline=True)
-
-        # Row 4
-        embed.add_field(name="Age", value=alert["age_days"], inline=False)
-
-        # Row 5: Presale Links & Socials
-        links_list = []
+        # Row 2: Presale Links (Prioritized)
+        presale_links_formatted = []
         if ld["primary_presale"]:
-            links_list.append(f"[{ld['primary_presale'][0]}]({ld['primary_presale'][1]})")
+            presale_links_formatted.append(f"📌 [{ld['primary_presale'][0]}]({ld['primary_presale'][1]})")
         if ld["secondary_presale"]:
-            links_list.append(f"[{ld['secondary_presale'][0]}]({ld['secondary_presale'][1]})")
+            presale_links_formatted.append(f"🔗 [{ld['secondary_presale'][0]}]({ld['secondary_presale'][1]})")
+
+        embed.add_field(name="Presale Access", value="\n".join(presale_links_formatted), inline=False)
+
+        # Row 3: Official Socials
+        social_links = []
         if ld["website"]:
-            links_list.append(f"[Website]({ld['website']})")
+            social_links.append(f"[Website]({ld['website']})")
         if ld["twitter"]:
-            links_list.append(f"[Twitter/X]({ld['twitter']})")
+            social_links.append(f"[Twitter/X]({ld['twitter']})")
 
-        embed.add_field(name="Official & Presale Links", value=" | ".join(links_list) if links_list else "None", inline=False)
+        embed.add_field(name="Official Socials", value=" | ".join(social_links) if social_links else "None", inline=False)
 
-        # Row 6 & 7
-        embed.add_field(name="Trade on GMGN", value=f"👈 [Open GMGN Live Chart]({alert['gmgn_link']})", inline=False)
+        # Row 4: Description
+        embed.add_field(name="Project Summary", value=f"```{alert['description']}```", inline=False)
+
+        # Row 5 & 6: GMGN Link & Contract Address
+        embed.add_field(name="Trade / Pre-Chart", value=f"👈 [Open GMGN Page]({alert['gmgn_link']})", inline=False)
         embed.add_field(name="Contract Address", value=f"`{alert['contract']}`", inline=False)
 
-        embed.set_footer(text="Pro Presale & Breakout Screener • 6h Deduplication Active")
+        embed.set_footer(text="Verified Presale Tracker • 6h Cooldown & Identity Lock Active")
 
         try:
             await channel.send(embed=embed)
             callout_cooldowns[alert["contract"]] = current_time
             seen_identities.add(alert["identity_key"])
-            print(f"[Discord] Sent alert for {alert['symbol']} ({alert['name']})", flush=True)
+            print(f"[Discord] Sent PRESALE alert for {alert['symbol']} ({alert['name']})", flush=True)
         except Exception as e:
             print(f"[Discord Send Error] {e}", flush=True)
 
