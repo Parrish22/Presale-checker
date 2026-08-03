@@ -96,12 +96,15 @@ async def check_goplus_security(session, chain_id, contract_address):
         return {"safe": True, "top10_percent": 0.0, "reason": "Exception Bypass"}
 
 
-# --- REFINED PRESALE LINK PARSER ---
+# --- DYNAMIC PRESALE PARSER ---
 
 def parse_presale_links(websites, socials, description=""):
     """
-    Parses links for presales. Accepts explicit PinkSale/Launchpad links first.
-    If presale keywords are present in text/header, uses official website as primary presale link.
+    Parses metadata and descriptions for presale indicators.
+    Priority:
+    1. Explicit PinkSale Link
+    2. Explicit Custom Presale Link
+    3. Official Website (if description indicates presale / fair launch)
     """
     official_website = None
     custom_presale_link = None
@@ -127,7 +130,7 @@ def parse_presale_links(websites, socials, description=""):
         elif not official_website and "http" in url_lower:
             official_website = url
 
-    # Regex search inside description text
+    # Regex search in description for raw URLs
     if description:
         if not pinksale_link:
             match = re.search(r'https?://[^\s]*pinksale\.[^\s]+', description, re.IGNORECASE)
@@ -139,7 +142,6 @@ def parse_presale_links(websites, socials, description=""):
             if match_custom:
                 custom_presale_link = match_custom.group(0).rstrip('.,)!')
 
-    # Keyword check: If description mentions presales and website exists, treat website as presale access
     desc_lower = description.lower() if description else ""
     is_presale_context = any(kw in desc_lower for kw in ["presale", "pink sale", "pinksale", "fair launch", "fairlaunch", "seed round", "launchpad", "ico"])
 
@@ -157,7 +159,7 @@ def parse_presale_links(websites, socials, description=""):
         if official_website:
             secondary_presale = ("Official Site", official_website)
     elif is_presale_context and official_website:
-        primary_presale = ("Primary Presale (Project Site)", official_website)
+        primary_presale = ("Primary Presale (Official Page)", official_website)
 
     return {
         "website": official_website,
@@ -167,66 +169,26 @@ def parse_presale_links(websites, socials, description=""):
     }
 
 
-# --- DIRECT PINKSALE API PARSER ---
-
-async def fetch_pinksale_presales(session):
-    """
-    Fetches active/upcoming presale pools directly from PinkSale's API stream.
-    """
-    pinksale_candidates = []
-    pinksale_api = "https://api.pinksale.finance/api/v1/pool/list?page=1&limit=25&status=1"
-    
-    data = await fetch_json(session, pinksale_api)
-    if isinstance(data, dict) and "docs" in data and isinstance(data["docs"], list):
-        for doc in data["docs"]:
-            if not isinstance(doc, dict): continue
-            
-            chain_raw = str(doc.get("chain", "")).lower()
-            chain = "bsc" if "56" in chain_raw or "bsc" in chain_raw else ("ethereum" if "1" in chain_raw or "eth" in chain_raw else "solana")
-            
-            contract = doc.get("tokenAddress") or doc.get("poolAddress")
-            name = doc.get("tokenName") or doc.get("name") or "PinkSale Presale"
-            symbol = str(doc.get("tokenSymbol") or doc.get("symbol") or "TOKEN").upper()
-            pool_id = doc.get("poolId") or doc.get("_id")
-            
-            pinksale_url = f"https://www.pinksale.finance/launchpad/{pool_id}?chain={chain.upper()}" if pool_id else "https://www.pinksale.finance"
-
-            pinksale_candidates.append({
-                "chainId": chain,
-                "tokenAddress": contract,
-                "header": name,
-                "symbol": symbol,
-                "description": f"Active PinkSale Presale for {name} (${symbol}).",
-                "direct_pinksale_url": pinksale_url,
-                "icon": doc.get("logo") or doc.get("image")
-            })
-
-    return pinksale_candidates
-
-
 # --- UNLAUNCHED PRESALE SCREENER ---
 
 async def screen_presales():
-    """Screens candidate sources EXCLUSIVELY for UNLAUNCHED Presales."""
+    """Screens candidate token sources for UNLAUNCHED Presales."""
     alerts = []
     candidate_items = []
     
     async with aiohttp.ClientSession() as session:
         current_time = datetime.now(timezone.utc)
 
-        # 1. Direct PinkSale Stream
-        ps_items = await fetch_pinksale_presales(session)
-        if ps_items:
-            candidate_items.extend(ps_items)
-
-        # 2. DexScreener Profile Feeds
+        # Fetch DexScreener Token Profiles & Boosted listings
         profiles = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
         latest_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/latest/v1")
+        top_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/top/v1")
 
         if isinstance(profiles, list): candidate_items.extend(profiles)
         if isinstance(latest_boosts, list): candidate_items.extend(latest_boosts)
+        if isinstance(top_boosts, list): candidate_items.extend(top_boosts)
 
-        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Collected {len(candidate_items)} potential presale candidates. Evaluating...", flush=True)
+        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Collected {len(candidate_items)} potential presale profiles. Evaluating...", flush=True)
 
         evaluated_contracts = set()
 
@@ -243,17 +205,15 @@ async def screen_presales():
             links = item.get("links", [])
             icon_url = item.get("icon")
 
-            # Parse presale links
+            # Parse Presale links or keywords
             link_data = parse_presale_links(links, links, description)
-            if not link_data["primary_presale"] and item.get("direct_pinksale_url"):
-                link_data["primary_presale"] = ("Primary Presale (PinkSale)", item["direct_pinksale_url"])
 
-            # RULE 1: REQUIRE PRESALE URL
+            # RULE 1: REQUIRE PRESALE CONTEXT OR LINK
             if not link_data["primary_presale"]:
-                print(f"  [Skip] ({contract[:6]}...): No presale URL or presale context found.", flush=True)
+                print(f"  [Skip] ({contract[:6]}...): No presale context or URL found.", flush=True)
                 continue
 
-            # RULE 2: DEX ACTIVE LIQUIDITY CHECK (Must not be trading live)
+            # RULE 2: DEX ACTIVE LIQUIDITY CHECK (Must NOT be actively trading)
             p_data = await fetch_json(session, f"https://api.dexscreener.com/tokens/v1/{chain}/{contract}")
             
             if isinstance(p_data, list) and len(p_data) > 0:
@@ -262,7 +222,7 @@ async def screen_presales():
                     liquidity_usd = float((pair_info.get("liquidity", {}) or {}).get("usd", 0) or 0)
                     volume_24h = float((pair_info.get("volume", {}) or {}).get("h24", 0) or 0)
 
-                    # Reject if trading is actively live on DEX (> $500 USD Liquidity)
+                    # Reject if trading is already active on DEX (> $500 USD Liquidity or Volume)
                     if liquidity_usd > 500.0 or volume_24h > 500.0:
                         print(f"  [Skip] ({contract[:6]}...): Already active on DEX (Liq: ${liquidity_usd:,.2f}, 24h Vol: ${volume_24h:,.2f}).", flush=True)
                         continue
@@ -281,16 +241,16 @@ async def screen_presales():
             # RULE 3: PERMANENT IDENTITY LOCK
             identity_key = (str(raw_name).lower().strip(), raw_symbol)
             if identity_key in seen_identities:
-                print(f"  [Skip] {raw_name} (${raw_symbol}): Identity lock active (already alerted previously).", flush=True)
+                print(f"  [Skip] {raw_name} (${raw_symbol}): Identity lock active.", flush=True)
                 continue
 
             # RULE 4: 6-HOUR CONTRACT COOLDOWN
             last_call = callout_cooldowns.get(contract)
             if last_call and (current_time - last_call) < timedelta(hours=COOLDOWN_HOURS):
-                print(f"  [Skip] {raw_symbol} ({contract[:6]}...): Under 6-hour contract cooldown.", flush=True)
+                print(f"  [Skip] {raw_symbol} ({contract[:6]}...): Under 6-hour cooldown.", flush=True)
                 continue
 
-            # RULE 5: GOPLUS SECURITY AUDIT
+            # RULE 5: GOPLUS SECURITY CHECK
             goplus_chain = "1" if chain == "ethereum" else ("56" if chain == "bsc" else chain)
             security = await check_goplus_security(session, goplus_chain, contract)
             if not security["safe"]:
@@ -354,14 +314,14 @@ async def tracker_loop():
         embed.add_field(name="Symbol", value=alert["symbol"], inline=True)
         embed.add_field(name="Network", value=alert["network"], inline=True)
 
-        # Row 2: Presale Links (Prioritized)
+        # Row 2: Presale Links
         presale_links_formatted = []
         if ld["primary_presale"]:
             presale_links_formatted.append(f"📌 [{ld['primary_presale'][0]}]({ld['primary_presale'][1]})")
         if ld["secondary_presale"]:
             presale_links_formatted.append(f"🔗 [{ld['secondary_presale'][0]}]({ld['secondary_presale'][1]})")
 
-        embed.add_field(name="Presale Access", value="\n".join(presale_links_formatted), inline=False)
+        embed.add_field(name="Presale Access", value="\n".join(presale_links_formatted) if presale_links_formatted else "See Official Socials", inline=False)
 
         # Row 3: Official Socials
         social_links = []
@@ -379,7 +339,7 @@ async def tracker_loop():
         embed.add_field(name="Pre-Chart / GMGN Page", value=f"👈 [Open GMGN Page]({alert['gmgn_link']})", inline=False)
         embed.add_field(name="Contract Address", value=f"`{alert['contract']}`", inline=False)
 
-        embed.set_footer(text="Verified Presale Tracker • Unlaunched Only • Direct Sourced")
+        embed.set_footer(text="Verified Presale Tracker • Unlaunched Only • 6h Cooldown Active")
 
         try:
             await channel.send(embed=embed)
