@@ -54,31 +54,31 @@ async def check_goplus_security(session, chain_id, contract_address):
     Bypasses Solana and handles unindexed contracts safely.
     """
     if chain_id == "sol" or not contract_address:
-        return {"safe": True, "top10_percent": 0.0}
+        return {"safe": True, "top10_percent": 0.0, "reason": "Solana/No CA"}
 
     url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={contract_address}"
     
     try:
         data = await fetch_json(session, url)
         if not data or not isinstance(data, dict):
-            return {"safe": True, "top10_percent": 0.0}
+            return {"safe": True, "top10_percent": 0.0, "reason": "No GoPlus Index"}
             
         result_map = data.get("result")
         if not result_map or not isinstance(result_map, dict):
-            return {"safe": True, "top10_percent": 0.0}
+            return {"safe": True, "top10_percent": 0.0, "reason": "No GoPlus Index"}
 
         res = result_map.get(contract_address.lower())
         if not res or not isinstance(res, dict):
-            return {"safe": True, "top10_percent": 0.0}
+            return {"safe": True, "top10_percent": 0.0, "reason": "Unindexed"}
         
         is_honeypot = str(res.get("is_honeypot", "0")) == "1"
         cannot_sell = str(res.get("cannot_sell_all", "0")) == "1"
         if is_honeypot or cannot_sell:
-            return {"safe": False, "top10_percent": 100.0}
+            return {"safe": False, "top10_percent": 100.0, "reason": "Honeypot / Cannot Sell Flag"}
 
         holders = res.get("holders", [])
         if not isinstance(holders, list) or len(holders) == 0:
-            return {"safe": True, "top10_percent": 0.0}
+            return {"safe": True, "top10_percent": 0.0, "reason": "Clean"}
 
         top10_percent = 0.0
         for holder in holders[:10]:
@@ -88,11 +88,12 @@ async def check_goplus_security(session, chain_id, contract_address):
                 except (ValueError, TypeError):
                     pass
 
-        return {"safe": top10_percent < 80.0, "top10_percent": top10_percent}
+        safe = top10_percent < 80.0
+        return {"safe": safe, "top10_percent": top10_percent, "reason": "Clean" if safe else "Top 10 Concentration > 80%"}
         
     except Exception as e:
         print(f"[GoPlus Exception] {e}", flush=True)
-        return {"safe": True, "top10_percent": 0.0}
+        return {"safe": True, "top10_percent": 0.0, "reason": "Exception Bypass"}
 
 
 # --- STRICT PRESALE LINK PARSER ---
@@ -194,19 +195,19 @@ async def fetch_pinksale_presales(session):
 # --- UNLAUNCHED PRESALE SCREENER ---
 
 async def screen_presales():
-    """Screens DEX metadata + Direct PinkSale API streams for unlaunched presales."""
+    """Screens candidate sources EXCLUSIVELY for UNLAUNCHED Presales."""
     alerts = []
     candidate_items = []
     
     async with aiohttp.ClientSession() as session:
         current_time = datetime.now(timezone.utc)
 
-        # 1. Fetch Direct PinkSale Presale Stream
+        # 1. Direct PinkSale Stream
         ps_items = await fetch_pinksale_presales(session)
         if ps_items:
             candidate_items.extend(ps_items)
 
-        # 2. Fetch DexScreener Profile & Boost Feeds
+        # 2. DexScreener Profile Feeds
         profiles = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
         latest_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/latest/v1")
 
@@ -230,16 +231,17 @@ async def screen_presales():
             links = item.get("links", [])
             icon_url = item.get("icon")
 
-            # Parse explicit presale links or use direct PinkSale URL if sourced from PinkSale API
+            # Parse explicit presale links
             link_data = parse_presale_links(links, links, description)
             if not link_data["primary_presale"] and item.get("direct_pinksale_url"):
                 link_data["primary_presale"] = ("Primary Presale (PinkSale)", item["direct_pinksale_url"])
 
-            # --- RULE 1: STRICT EXPLICIT PRESALE URL REQUIREMENT ---
+            # RULE 1: STRICT PRESALE URL REQUIREMENT
             if not link_data["primary_presale"]:
+                print(f"  [Skip] ({contract[:6]}...): No explicit presale URL found in metadata.", flush=True)
                 continue
 
-            # --- RULE 2: KILL-SWITCH FOR ACTIVE DEX TRADING PAIRS ---
+            # RULE 2: DEX ACTIVE LIQUIDITY CHECK
             p_data = await fetch_json(session, f"https://api.dexscreener.com/tokens/v1/{chain}/{contract}")
             
             if isinstance(p_data, list) and len(p_data) > 0:
@@ -248,8 +250,8 @@ async def screen_presales():
                     liquidity_usd = float((pair_info.get("liquidity", {}) or {}).get("usd", 0) or 0)
                     volume_24h = float((pair_info.get("volume", {}) or {}).get("h24", 0) or 0)
 
-                    # Reject if it's already trading live on DEX
-                    if liquidity_usd > 100.0 or volume_24h > 100.0:
+                    # Reject if trading is actively live on DEX (> $500 USD Liquidity)
+                    if liquidity_usd > 500.0 or volume_24h > 500.0:
                         print(f"  [Skip] ({contract[:6]}...): Already active on DEX (Liq: ${liquidity_usd:,.2f}, 24h Vol: ${volume_24h:,.2f}).", flush=True)
                         continue
             else:
@@ -264,23 +266,23 @@ async def screen_presales():
             if raw_symbol in EXCLUDED_SYMBOLS:
                 continue
 
-            # --- RULE 3: PERMANENT IDENTITY LOCK (Name + Symbol) ---
+            # RULE 3: PERMANENT IDENTITY LOCK
             identity_key = (str(raw_name).lower().strip(), raw_symbol)
             if identity_key in seen_identities:
-                print(f"  [Skip] {raw_name} (${raw_symbol}): Already alerted previously.", flush=True)
+                print(f"  [Skip] {raw_name} (${raw_symbol}): Identity lock active (already alerted previously).", flush=True)
                 continue
 
-            # --- RULE 4: 6-HOUR CONTRACT COOLDOWN ---
+            # RULE 4: 6-HOUR CONTRACT COOLDOWN
             last_call = callout_cooldowns.get(contract)
             if last_call and (current_time - last_call) < timedelta(hours=COOLDOWN_HOURS):
                 print(f"  [Skip] {raw_symbol} ({contract[:6]}...): Under 6-hour contract cooldown.", flush=True)
                 continue
 
-            # --- RULE 5: GOPLUS SECURITY AUDIT ---
+            # RULE 5: GOPLUS SECURITY AUDIT
             goplus_chain = "1" if chain == "ethereum" else ("56" if chain == "bsc" else chain)
             security = await check_goplus_security(session, goplus_chain, contract)
             if not security["safe"]:
-                print(f"  [Skip] {raw_name} ({contract[:6]}...): Failed GoPlus security check.", flush=True)
+                print(f"  [Skip] {raw_name} ({contract[:6]}...): Failed GoPlus check ({security['reason']}).", flush=True)
                 continue
 
             display_network = "Robinhood ETH" if chain == "ethereum" else chain.upper()
@@ -307,7 +309,7 @@ async def screen_presales():
 @tasks.loop(minutes=5)
 async def tracker_loop():
     print(f"\n=========================================", flush=True)
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Direct Presale Scan...", flush=True)
+    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Starting Presale Scan...", flush=True)
     print(f"=========================================", flush=True)
     
     channel = bot.get_channel(CHANNEL_ID)
