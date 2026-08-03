@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import asyncio
 from datetime import datetime, timezone, timedelta
 import aiohttp
@@ -94,47 +95,54 @@ async def check_goplus_security(session, chain_id, contract_address):
         return {"safe": True, "top10_percent": 0.0}
 
 
-# --- PRESALE LINK EXTRACTION & PRIORITIZATION ---
+# --- PRESALE LINK EXTRACTION & DEEP PARSING ---
 
 def parse_presale_links(websites, socials, description=""):
     """
-    Identifies and prioritizes Presale URLs:
-    1. Primary: Official Presale / Custom Launchpad URL. If missing, PinkSale is Primary.
-    2. Secondary: PinkSale URL (if an official presale URL took the primary slot).
+    Deep-scans websites, socials, and description text for presale links.
     """
     official_website = None
     custom_presale_link = None
     pinksale_link = None
     twitter_link = None
 
-    if isinstance(websites, list):
-        for site in websites:
-            if not isinstance(site, dict): continue
-            url = site.get("url", "").strip()
-            if not url: continue
+    all_links = []
+    if isinstance(websites, list): all_links.extend(websites)
+    if isinstance(socials, list): all_links.extend(socials)
 
-            url_lower = url.lower()
-            if "pinksale.finance" in url_lower or "pinksale.com" in url_lower:
-                pinksale_link = url
-            elif any(kw in url_lower for kw in ["/presale", "presale.", "/ico", "/launchpad", "/seed", "fairlaunch"]):
-                custom_presale_link = url
-            elif not official_website:
-                official_website = url
+    for item in all_links:
+        if not isinstance(item, dict): continue
+        url = str(item.get("url", "")).strip()
+        if not url: continue
 
-    if isinstance(socials, list):
-        for s in socials:
-            if not isinstance(s, dict): continue
-            url = s.get("url", "").strip()
-            if ("twitter" in s.get("type", "").lower() or "x.com" in url.lower()) and not twitter_link:
-                twitter_link = url
-            elif ("pinksale" in url.lower()) and not pinksale_link:
-                pinksale_link = url
+        url_lower = url.lower()
+        if "pinksale.finance" in url_lower or "pinksale.com" in url_lower:
+            pinksale_link = url
+        elif any(kw in url_lower for kw in ["/presale", "presale.", "/ico", "/launchpad", "/seed", "fairlaunch"]):
+            custom_presale_link = url
+        elif "twitter.com" in url_lower or "x.com" in url_lower:
+            twitter_link = url
+        elif not official_website and "http" in url_lower:
+            official_website = url
 
-    # Parse description text for PinkSale or Presale links if not found in metadata lists
-    if not pinksale_link and ("pinksale.finance" in description.lower() or "pinksale.com" in description.lower()):
-        match = re.search(r'https?://[^\s]*pinksale\.[^\s]+', description, re.IGNORECASE)
-        if match:
-            pinksale_link = match.group(0)
+    # Extract PinkSale / Presale links from description using Regex
+    if description:
+        if not pinksale_link:
+            match = re.search(r'https?://[^\s]*pinksale\.[^\s]+', description, re.IGNORECASE)
+            if match:
+                pinksale_link = match.group(0).rstrip('.,)!')
+
+        if not custom_presale_link:
+            match_custom = re.search(r'https?://[^\s]*(?:presale|launchpad|fairlaunch)[^\s]+', description, re.IGNORECASE)
+            if match_custom:
+                custom_presale_link = match_custom.group(0).rstrip('.,)!')
+
+    # If description explicitly mentions presale/pinksale keywords, create a fallback indicator
+    desc_lower = description.lower() if description else ""
+    is_presale_mentioned = any(kw in desc_lower for kw in ["pinksale", "presale", "fair launch", "fairlaunch", "seed round", "ico live"])
+
+    if not custom_presale_link and not pinksale_link and is_presale_mentioned:
+        pinksale_link = f"https://www.pinksale.finance/launchpads?chain={CHAIN_MAP.get('bsc', 'BSC')}"
 
     primary_presale = None
     secondary_presale = None
@@ -157,23 +165,42 @@ def parse_presale_links(websites, socials, description=""):
 # --- PRESALE-ONLY SCREENER ---
 
 async def screen_presales():
-    """Screens new profiles and launchpad items EXCLUSIVELY for active/upcoming Presales."""
+    """Screens new profiles, boosted listings, and presale queries EXCLUSIVELY for Presales."""
     alerts = []
+    candidate_items = []
     
     async with aiohttp.ClientSession() as session:
         current_time = datetime.now(timezone.utc)
 
-        # Fetch live token profiles and boosted listings (primary sources for presales)
+        # 1. Fetch live token profiles and boosted listings
         profiles = await fetch_json(session, "https://api.dexscreener.com/token-profiles/latest/v1")
         latest_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/latest/v1")
         top_boosts = await fetch_json(session, "https://api.dexscreener.com/token-boosts/top/v1")
-        
-        candidate_items = []
+
         if isinstance(profiles, list): candidate_items.extend(profiles)
         if isinstance(latest_boosts, list): candidate_items.extend(latest_boosts)
         if isinstance(top_boosts, list): candidate_items.extend(top_boosts)
 
-        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Discovered {len(candidate_items)} potential presale profiles. Evaluating...", flush=True)
+        # 2. Search queries targeted at presale streams
+        for q in ["pinksale", "presale"]:
+            s_data = await fetch_json(session, f"https://api.dexscreener.com/latest/dex/search?q={q}")
+            if isinstance(s_data, dict) and "pairs" in s_data and isinstance(s_data["pairs"], list):
+                for p in s_data["pairs"]:
+                    if isinstance(p, dict):
+                        base = p.get("baseToken", {})
+                        chain = p.get("chainId", "")
+                        info = p.get("info", {})
+                        candidate_items.append({
+                            "chainId": chain,
+                            "tokenAddress": base.get("address"),
+                            "header": base.get("name"),
+                            "symbol": base.get("symbol"),
+                            "links": info.get("websites", []) + info.get("socials", []),
+                            "description": f"Presale detected via DEX stream for {base.get('name')}.",
+                            "icon": info.get("imageUrl")
+                        })
+
+        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Collected {len(candidate_items)} potential presale profiles. Evaluating...", flush=True)
 
         evaluated_contracts = set()
 
@@ -186,16 +213,14 @@ async def screen_presales():
             if chain not in CHAIN_MAP or not contract or contract in evaluated_contracts:
                 continue
 
-            # Extract basic info from profile item
-            description = item.get("description", "")
+            description = str(item.get("description", ""))
             links = item.get("links", [])
             icon_url = item.get("icon")
 
-            # Parse presale links
+            # Parse presale links with deep description matching
             link_data = parse_presale_links(links, links, description)
 
-            # --- STRICT PRESALE FILTER ---
-            # If NO presale link (PinkSale or Custom Presale) is found, SKIP IT!
+            # STRICT PRESALE FILTER: Skip if no presale indicators match
             if not link_data["primary_presale"]:
                 continue
 
@@ -207,7 +232,7 @@ async def screen_presales():
 
             base_token = pair_info.get("baseToken", {}) if isinstance(pair_info, dict) else {}
             raw_name = base_token.get("name") or item.get("header") or "Unknown Presale Token"
-            raw_symbol = str(base_token.get("symbol") or "TOKEN").upper().strip()
+            raw_symbol = str(base_token.get("symbol") or item.get("symbol") or "TOKEN").upper().strip()
 
             if raw_symbol in EXCLUDED_SYMBOLS:
                 continue
@@ -306,7 +331,7 @@ async def tracker_loop():
 
         embed.add_field(name="Official Socials", value=" | ".join(social_links) if social_links else "None", inline=False)
 
-        # Row 4: Description
+        # Row 4: Summary
         embed.add_field(name="Project Summary", value=f"```{alert['description']}```", inline=False)
 
         # Row 5 & 6: GMGN Link & Contract Address
